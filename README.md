@@ -35,7 +35,7 @@ You can use a shell commands to achieve similar result:
 serve http file on port 1111:
 ```shell
 {
-    echo -ne "HTTP/1.0 200 OK\r\nContent-Length: "$(wc -c < bekken.bin.xz.ota)"\r\n\r\n"
+    echo -ne "HTTP/1.0 200 OK\r\nContent-Length: "$(wc -c < OpenBL602_1.17.551_OTA.bin.xz.ota)"\r\n\r\n"
     cat  OpenBL602_1.17.551_OTA.bin.xz.ota 
 } | nc -l 1111
 ```
@@ -44,12 +44,13 @@ invoke flashing process (from another terminal):
 echo -e "AT+UPURL=http://10.10.123.4:1111/update?version=33_00_20240418_OpenBeken&beta,pierogi" | nc -u 10.10.123.3 48899
 ```
 List of all AT commands recognized by firmware is available [here](reverse_engineer/at_commands.txt) 
-
+For example to check version before flashing use:
+```shell
+echo -e "AT+LVER\r" | nc -u 10.10.123.3 48899
+```
 ## TODO
 
 The following features are planned for future releases of Magic Home Flasher to enhance its functionality and user experience:
-
-- **Progress Bar Integration**: Implement a progress bar to provide real-time feedback during the firmware installation process. This will help users understand the current status of the update and estimate the time remaining until completion.
 
 - **Wi-Fi Settings Configuration**: Add the capability to change the SSID and password of the Magic Home device directly from the app. This feature will allow users to manage their device's network settings easily without needing additional tools.
 
