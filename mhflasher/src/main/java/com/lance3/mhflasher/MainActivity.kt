@@ -25,28 +25,40 @@ import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.annotation.RequiresApi
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.text.BasicTextField
+import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.material3.Button
+import androidx.compose.material3.LinearProgressIndicator
+import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Tab
 import androidx.compose.material3.TabRow
 import androidx.compose.material3.Text
+import androidx.compose.material3.TextFieldDefaults
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableIntStateOf
+import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.font.FontFamily
+import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.unit.dp
 import androidx.core.app.ActivityCompat
 import androidx.core.content.ContextCompat
@@ -62,10 +74,16 @@ import java.net.InetAddress
 import java.net.ServerSocket
 import java.net.SocketTimeoutException
 
+object Constants {
+    const val OTA_PORT = 1111
+    const val CMD_PORT = 48899
+    const val CODE_PLACEHOLDER = "pierogi"
+}
+
 enum class CMD(val str: String){
     INFO("HF-A11ASSISTHREAD"),
     VER("AT+LVER\n"),
-    OTA("AT+UPURL=http://10.10.123.4:1111/update?version=33_48_20240418_OpenBeken&beta,pierogi")
+    OTA("AT+UPURL=http://10.10.123.4:${Constants.OTA_PORT}/update?version=33_00_20240418_OpenBeken&beta,${Constants.CODE_PLACEHOLDER}")
 }
 class MainActivity : ComponentActivity() {
     private val logViewModel = LogViewModel()
@@ -78,7 +96,7 @@ class MainActivity : ComponentActivity() {
         Log.d("LOG","On create")
         setContent {
             MagicHomeFlasherTheme {
-                MyApp(logViewModel, apViewModel, {wifiCheckAndScan()}, {ap -> wifiConnect(ap)})
+                MyApp(logViewModel, apViewModel, {wifiCheckAndScan()}, {ap -> wifiConnect(ap)},{ip -> checkDeviceByIP(ip)}, {flashDevice()})
             }
         }
         startHttpServer(applicationContext)
@@ -201,6 +219,8 @@ class MainActivity : ComponentActivity() {
             override fun onAvailable(network: Network) {
                 super.onAvailable(network)
                 logViewModel.addLog("Connected to ${ap.name}")
+                apViewModel.connectedAP.value = ap.name
+                apViewModel.clearAccessPoints()
                 connectivityManager.bindProcessToNetwork(network)
             }
 
@@ -210,13 +230,16 @@ class MainActivity : ComponentActivity() {
                 addresses.forEach {
                     if (it.address is Inet4Address) { // Filter for IPv4 address
                         logViewModel.addLog("got dhcp IPv4: ${it.address.hostAddress}")
+                        apViewModel.isConnected.value = true
+                        apViewModel.localIP.value = it.address.hostAddress
                     }
                 }
                 val dnsServers = linkProperties.dnsServers
                 if (dnsServers.isNotEmpty()) {
                     val firstDnsServer = dnsServers[0].hostAddress
                     logViewModel.addLog("First DNS Server: $firstDnsServer")
-                    sendUdpPacket(dnsServers[0],48899, CMD.INFO)
+                    apViewModel.remoteIP.value = firstDnsServer
+                    sendUdpPacket(dnsServers[0],Constants.CMD_PORT, CMD.INFO)
                 } else {
                     logViewModel.addLog("No DNS servers available")
                 }
@@ -224,17 +247,47 @@ class MainActivity : ComponentActivity() {
             override fun onUnavailable() {
                 super.onUnavailable()
                 logViewModel.addLog("Failed to connect to ${ap.name}")
+                apViewModel.isConnected.value = false
             }
 
             override fun onLost(network: Network) {
                 super.onLost(network)
                 logViewModel.addLog("Lost connection to ${ap.name}")
+                apViewModel.isConnected.value = false
             }
         }
 
         connectivityManager.requestNetwork(request, callback)
     }
 
+    private fun checkDeviceByIP(ipString: String){
+        val ip = convertToInetAddress(ipString)
+        if(ip == null){
+            Toast.makeText(
+                applicationContext,
+                "Wrong ip: $ipString",
+                Toast.LENGTH_LONG
+            ).show()
+        } else {
+            sendUdpPacket(ip,Constants.CMD_PORT,CMD.INFO)
+        }
+    }
+
+    fun convertToInetAddress(ipInput: String): InetAddress? {
+        return try {
+            InetAddress.getByName(ipInput)
+        } catch (e: Exception) {
+            null
+        }
+    }
+    private fun flashDevice() {
+        val inetAddress = convertToInetAddress(apViewModel.remoteIP.value)
+        if (inetAddress != null) {
+            sendUdpPacket(inetAddress, Constants.CMD_PORT, CMD.OTA)
+        } else {
+            logViewModel.addLog("Invalid IP address: ${apViewModel.remoteIP.value}")
+        }
+    }
     private fun sendUdpPacket(ip: InetAddress, port: Int, cmd: CMD) {
         val thread = Thread {
             try {
@@ -257,7 +310,8 @@ class MainActivity : ComponentActivity() {
                             }
                             CMD.VER -> {
                                 logViewModel.addLog("ver: $receivedText")
-                                sendUdpPacket(ip,port, CMD.OTA)
+                                apViewModel.firmwareVersion.value= receivedText.split("=")[1]
+//                                sendUdpPacket(ip,port, CMD.OTA)
                             }
                             else -> {
                                 logViewModel.addLog("unk: $receivedText")
@@ -265,11 +319,13 @@ class MainActivity : ComponentActivity() {
                         }
 
                     } catch (e: SocketTimeoutException) {
-                        logViewModel.addLog("Timeout: No response received within 2 seconds")
+                        val info="Timeout: No response received within 2 seconds"
+                        logViewModel.addLog(info)
                     }
                 }
             } catch (e: Exception) {
-                logViewModel.addLog("Error sending or receiving packet: ${e.message}")
+                val info="Error sending or receiving packet: ${e.message}"
+                logViewModel.addLog(info)
             }
         }
         thread.start()
@@ -280,15 +336,17 @@ class MainActivity : ComponentActivity() {
         val parts=str.split(",")
         if (parts.count() > 2){
             logViewModel.addLog("\tmac:${parts[1]}")
+            apViewModel.macAddress.value=parts[1]
             logViewModel.addLog("\tdev id:${parts[2]}")
+            apViewModel.deviceId.value=parts[2]
         }
     }
 
     private fun startHttpServer(context: Context) {
         Thread {
             try {
-                val serverSocket = ServerSocket(1111)  // port 1111
-                logViewModel.addLog("Server is running on port 1111")
+                val serverSocket = ServerSocket(Constants.OTA_PORT)
+                logViewModel.addLog("OTA server is running on port ${Constants.OTA_PORT}")
 
                 while (!Thread.currentThread().isInterrupted) {
                     val socket = serverSocket.accept()
@@ -301,6 +359,7 @@ class MainActivity : ComponentActivity() {
                         requestLines.add(line!!)
                     }
                     logViewModel.addLog("Received HTTP Request:")
+                    apViewModel.flashProgress.value=0f
                     requestLines.forEach { logViewModel.addLog(it) }
 
                     val fileInput = context.assets.open("OpenBL602_1.17.551_OTA.bin.xz.ota_cutted") //cutted=checksum error, test transfer only, no final flash
@@ -309,15 +368,16 @@ class MainActivity : ComponentActivity() {
 
                     output.write(httpResponse.toByteArray())
 
-                    val buffer = ByteArray(1024)
+                    val buffer = ByteArray(1024*10)
                     var totalSentBytes = 0
                     var bytesRead: Int
                     while (fileInput.read(buffer).also { bytesRead = it } != -1) {
                         output.write(buffer, 0, bytesRead)
                         totalSentBytes += bytesRead
                         logViewModel.addLog("Sent $totalSentBytes of $fileSize bytes")
+                        apViewModel.flashProgress.value = totalSentBytes.toFloat()/fileSize
                     }
-
+                    logViewModel.addLog("Finished uploading $totalSentBytes bytes")
                     output.flush()
                     output.close()
                     fileInput.close()
@@ -337,7 +397,15 @@ class MainActivity : ComponentActivity() {
 }
 
 @Composable
-fun MyApp(logViewModel: LogViewModel, apViewModel: ApViewModel, onScanClick: () -> Unit, onConnectClick: (WifiAP) -> kotlin.Unit, selTab: Int = 0) {
+fun MyApp(
+    logViewModel: LogViewModel,
+    apViewModel: ApViewModel,
+    onScanClick: () -> Unit,
+    onConnectClick: (WifiAP) -> kotlin.Unit,
+    onCheckDeviceClick: (String) -> Unit,
+    onFlashClick: () -> Unit,
+    selTab: Int = 0
+) {
     var tabIndex by remember { mutableIntStateOf(selTab) }
     val tabTitles = listOf("flash", "log", "about")
     Column(modifier = Modifier.fillMaxSize()) {
@@ -350,14 +418,21 @@ fun MyApp(logViewModel: LogViewModel, apViewModel: ApViewModel, onScanClick: () 
             }
         }
         when (tabIndex) {
-            0 -> MainTabContent(logViewModel,apViewModel,onScanClick, onConnectClick)
+            0 -> MainTabContent(logViewModel,apViewModel,onScanClick,onConnectClick, onCheckDeviceClick, onFlashClick)
             1 -> LogTabContent(logViewModel)
         }
     }
 }
 
 @Composable
-fun MainTabContent(logViewModel: LogViewModel, apViewModel: ApViewModel, onScanClick: () -> Unit, onConnectClick: (WifiAP) -> Unit) {
+fun MainTabContent(
+    logViewModel: LogViewModel,
+    apViewModel: ApViewModel,
+    onScanClick: () -> Unit,
+    onConnectClick: (WifiAP) -> Unit,
+    onCheckDeviceClick: (String) -> Unit,
+    onFlashClick: () -> Unit
+) {
     Column(
         modifier = Modifier.fillMaxSize(),
         horizontalAlignment = Alignment.CenterHorizontally
@@ -380,10 +455,48 @@ fun MainTabContent(logViewModel: LogViewModel, apViewModel: ApViewModel, onScanC
             logViewModel.addLog("clicked scan")
             onScanClick()
         }) {
-            Text(text = "Search WiFi device")
+            Text(text = "Scan for WIFI device")
         }
+        DeviceDetailsTable(apViewModel)
+
+        if (apViewModel.firmwareVersion.value.isNotEmpty()) {
+            Button(onClick = { onFlashClick() }) {
+                Text(text = "Flash")
+            }
+        }
+
+        if (apViewModel.flashProgress.value > 0) {
+            LinearProgressIndicator(
+                progress = apViewModel.flashProgress.value,
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(16.dp),
+                color = MaterialTheme.colorScheme.primary,
+                trackColor = MaterialTheme.colorScheme.background
+            )
+        }
+
     }
 }
+/*
+Text("or", style = MaterialTheme.typography.titleMedium, modifier = Modifier.padding(vertical = 8.dp))
+OutlinedTextField(
+    value = apViewModel.remoteIP.value,
+    onValueChange = { newValue ->
+        apViewModel.remoteIP.value = newValue
+    },
+    label = { Text("Enter device IP") },
+    singleLine = true,
+    textStyle = TextStyle(color = Color.Black),
+    keyboardOptions = KeyboardOptions.Default.copy(
+        keyboardType = KeyboardType.Decimal,
+        autoCorrect = false
+    )
+)
+Button(onClick = { onCheckDeviceClick(apViewModel.remoteIP.value) }) {
+    Text(text = "Check device")
+}
+ */
 
 @Composable
 fun LogTabContent(logViewModel: LogViewModel) {
@@ -401,6 +514,59 @@ fun LogTabContent(logViewModel: LogViewModel) {
         Spacer(modifier = Modifier.height(8.dp))
         Button(onClick = { logViewModel.clearLog() }) {
             Text("clear")
+        }
+    }
+}
+
+@Composable
+fun AboutTabContent(){
+
+}
+@Composable
+fun DeviceDetailsTable(apViewModel: ApViewModel) {
+    if (apViewModel.isConnected.value) {
+        Column(
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(16.dp)
+        ) {
+            Text("Connected Device Details")
+
+            Row(modifier = Modifier.padding(top = 8.dp)) {
+                Text("AP:", fontWeight = FontWeight.Bold)
+                Spacer(Modifier.width(8.dp))
+                Text(apViewModel.connectedAP.value)
+            }
+
+            Row(modifier = Modifier.padding(top = 8.dp)) {
+                Text("MAC Address:", fontWeight = FontWeight.Bold)
+                Spacer(Modifier.width(8.dp))
+                Text(apViewModel.macAddress.value)
+            }
+
+            Row(modifier = Modifier.padding(top = 8.dp)) {
+                Text("Device ID:", fontWeight = FontWeight.Bold)
+                Spacer(Modifier.width(8.dp))
+                Text(apViewModel.deviceId.value)
+            }
+
+            Row(modifier = Modifier.padding(top = 8.dp)) {
+                Text("Firmware Version:", fontWeight = FontWeight.Bold)
+                Spacer(Modifier.width(8.dp))
+                Text(apViewModel.firmwareVersion.value)
+            }
+
+            Row(modifier = Modifier.padding(top = 8.dp)) {
+                Text("Device IP:", fontWeight = FontWeight.Bold)
+                Spacer(Modifier.width(8.dp))
+                Text(apViewModel.remoteIP.value)
+            }
+
+            Row(modifier = Modifier.padding(top = 8.dp)) {
+                Text("My IP:", fontWeight = FontWeight.Bold)
+                Spacer(Modifier.width(8.dp))
+                Text(apViewModel.localIP.value)
+            }
         }
     }
 }

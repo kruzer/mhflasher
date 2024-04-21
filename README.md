@@ -30,6 +30,13 @@ These instructions will guide you through the setup and operation of Magic Home 
 ## Firmware
 The firmware used by Magic Home Flasher is provided by the OpenBK7231T_App project. You can find more information and contribute to the firmware development at [OpenBeken_App GitHub Repository](https://github.com/openshwprojects/OpenBK7231T_App).
 
+## Reverse engineer risc-v chip
+All info is based on the process of a reverse engineering the risc-v Boufalo Laabs chip bl602 diescribed [here](/reverse_engineeer)
+You can use a shell commands to achieve similar result:
+```sh
+#serve http file on port 1111:
+nc 
+```
 ## TODO
 
 The following features are planned for future releases of Magic Home Flasher to enhance its functionality and user experience:
