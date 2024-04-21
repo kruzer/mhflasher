@@ -1,7 +1,7 @@
 # Magic Home Flasher (BL602)
 
 ## Introduction
-Magic Home Flasher is an Android application designed to flash Magic Home devices equipped with a BL602 chip using the OpenBeken firmware available from the OpenBeken_App project on GitHub. This tool simplifies the process of updating devices to use open-source firmware, enhancing their functionality and customizability.
+Magic Home Flasher is an Android application designed to flash Magic Home devices equipped with a RISC-V BL602 chip using the OpenBeken firmware available from the OpenBeken_App project on GitHub. This tool simplifies the process of updating devices to use open-source firmware, enhancing their functionality and customizability.
 
 ## Features
 - **Simple Device Updating**: Select and flash devices with new firmware directly over the air.
@@ -12,11 +12,10 @@ These instructions will guide you through the setup and operation of Magic Home 
 
 ### Prerequisites
 - An Android device running Android 29 or higher.
-- Access to a Wi-Fi network.
 - A Magic Home device with a BL602 chip within range.
 
 ### Installation
-1. Download the latest release of Magic Home Flasher from the [Releases](https://github.com/yourgithub/MagicHomeFlasher/releases) section on GitHub.
+1. Download the latest release of Magic Home Flasher from the [Releases](https://github.com/kruzer/mhflasher/releases) section on GitHub.
 2. Install the APK on your Android device. You may need to enable installation from unknown sources in your device settings.
 
 ### Usage
@@ -67,7 +66,7 @@ This project is licensed under the MIT License - see the [LICENSE.md](LICENSE.md
 - Community contributions that help improve this tool.
 
 ## Support
-For support, email contact@yourdomain.com or open an issue in the GitHub repository.
+For support, open an issue in the GitHub repository.
 
 ---
 For more information on how to use Magic Home Flasher, please refer to the wiki or contact support.
