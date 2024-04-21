@@ -32,10 +32,19 @@ The firmware used by Magic Home Flasher is provided by the OpenBK7231T_App proje
 ## Reverse engineer risc-v chip
 All info is based on the process of a reverse engineering the risc-v Boufalo Laabs chip bl602 diescribed [here](/reverse_engineeer)
 You can use a shell commands to achieve similar result:
-```sh
-#serve http file on port 1111:
-nc 
+serve http file on port 1111:
+```shell
+{
+    echo -ne "HTTP/1.0 200 OK\r\nContent-Length: "$(wc -c < bekken.bin.xz.ota)"\r\n\r\n"
+    cat  OpenBL602_1.17.551_OTA.bin.xz.ota 
+} | nc -l 1111
 ```
+invoke flashing process (from another terminal):
+```shell
+echo -e "AT+UPURL=http://10.10.123.4:1111/update?version=33_00_20240418_OpenBeken&beta,pierogi" | nc -u 10.10.123.3 48899
+```
+List of all AT commands recognized by firmware is available [here](reverse_engineer/at_commands.txt) 
+
 ## TODO
 
 The following features are planned for future releases of Magic Home Flasher to enhance its functionality and user experience:

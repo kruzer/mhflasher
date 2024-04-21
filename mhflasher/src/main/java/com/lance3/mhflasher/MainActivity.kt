@@ -362,7 +362,8 @@ class MainActivity : ComponentActivity() {
                     apViewModel.flashProgress.value=0f
                     requestLines.forEach { logViewModel.addLog(it) }
 
-                    val fileInput = context.assets.open("OpenBL602_1.17.551_OTA.bin.xz.ota_cutted") //cutted=checksum error, test transfer only, no final flash
+                    //val fileInput = context.assets.open("OpenBL602_1.17.551_OTA.bin.xz.ota_cutted") //cutted=checksum error, test transfer only, no final flash
+                    val fileInput = context.assets.open("OpenBL602_1.17.551_OTA.bin.xz.ota")
                     val fileSize = fileInput.available()
                     val httpResponse = "HTTP/1.0 200 OK\r\nContent-Length: $fileSize\r\n\r\n"
 
