@@ -26,6 +26,8 @@ These instructions will guide you through the setup and operation of Magic Home 
 5. The app will automatically handle the OTA update process by serving the firmware over an internal HTTP server.
 6. Once the device downloads and applies the firmware, it will reboot automatically, running the new OpenBeken system.
 
+<img src="img/Screenshot_20240422-001651_mhflasher.png" width="200">
+
 ## Firmware
 The firmware used by Magic Home Flasher is provided by the OpenBK7231T_App project. You can find more information and contribute to the firmware development at [OpenBeken_App GitHub Repository](https://github.com/openshwprojects/OpenBK7231T_App).
 
