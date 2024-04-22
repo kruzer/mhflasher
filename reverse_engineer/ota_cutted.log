@@ -1,0 +1,146 @@
+UDP recv IP:10.10.123.4
+UDP recv Port:56639
+HF-A11ASSISTHREAD
+
+fetch mac [B4E842290716]
+UDP(sk 1) send status 37 bytes
+UDP recv IP:10.10.123.4
+UDP recv Port:41741
+AT+LVER
+
+UDP(sk 1) send status 25 bytes
+UDP recv IP:10.10.123.4
+UDP recv Port:57714
+AT+UPURL=http://10.10.123.4:1111/update?version=33_48_20240418_OpenBeken&beta,pierogi
+UDP(sk 1) send status 4 bytes
+OTA fech code :pierogi(7)
+fetch host : (11) 10.10.123.4 1111
+feth path : (45) /update?version=33_48_20240418_OpenBeken&beta 
+
+device ..........    ota_device_beta       : |1| 
+device ..........    ota_device_type       : |33| 
+device ..........    flash_device_type     : |33| 
+device ..........    ota_manufacturer_id   : |OpenBeken| 
+device ..........    flash_manufacturer_id : |ZG-BL| 
+
+ota: g_timeout_timer = start 
+wait for watchdog stop success
+
+fetch mac [B4E842290716]
+origin_code: pierogi 
+encry_code: 82CC963255 
+fota url:http://10.10.123.4:1111/update?version=33_48_20240418_OpenBeken&beta&filename=FW_OTA.bin.ota&checkcode={82CC963255}&mac=B4E842290716(132)
+ota host name:10.10.123.4(11):1111 path:/update?version=33_48_20240418_OpenBeken&beta&filename=FW_OTA.bin.ota&checkcode={82CC963255}&mac=B4E842290716
+zg_ota_task
+[HTTPC] hdr_len is 43, content_len is 409600
+[MTD] >>>>>> Hanlde info Dump >>>>>>
+      name FW
+      id 0
+      offset 0x000d8000(884736)
+      size 0x000b7000(732Kbytes)
+      xip_addr 0x00000000
+[MTD] <<<<<< Hanlde info End <<<<<<
+otaTotalLength : 409600, bin_size : 749568
+[HTTPC] Received 645 Bytes
+otaoffset : 645
+[OTA] [HEADER] ota header is BL60X_OTA_Ver1.0
+[OTA] [HEADER] file type is XZ  
+[OTA] [HEADER] file length (exclude ota header) is 426776
+[OTA] [HEADER] ver_hardware is BFL_Module_v1.1
+[OTA] [HEADER] ver_software is EVENT_V1.1.1
+[OTA] [HEADER] sha256 is 12B2B062A3861B058A112B4440F3C00C199A4A4C1ACB28C0DC3A6DC6117F0312
+[HTTPC] Received 688 Bytes
+otaoffset : 821
+Write 821[409600]
+[HTTPC] Received 688 Bytes
+otaoffset : 688
+Write 1509[409600]
+[HTTPC] Received 688 Bytes
+otaoffset : 688
+Write 2197[409600]
+ota process begin, exit tcp server task.
+
+[HTTPC] Received 688 Bytes
+otaoffset : 688
+Write 2885[409600]
+[HTTPC] Received 688 Bytes
+otaoffset : 688
+Write 3573[409600]
+[HTTPC] Received 688 Bytes
+otaoffset : 688
+Write 4261[409600]
+[HTTPC] Received 688 Bytes
+otaoffset : 688
+Write 4949[409600]
+UDP(sk 1) send status 7 bytes
+event:ota process
+UDP(sk 1) send status 7 bytes
+[HTTPC] Received 688 Bytes
+otaoffset : 688
+Write 5637[409600]
+[HTTPC] Received 688 Bytes
+otaoffset : 688
+-----------------> AABA Request:
+    A-MSDU: Not Permitted
+    Block Ack Policy: Immediate Block Ack
+    TID: 7
+    Number of Buffers: 64
+-----------------> AABA Response:
+    A-MSDU: Not Permitted
+    Block Ack PolicWrite 6325[409600]
+y: Immediate Block Ack
+    TID: 7
+    Number of Buffers: 8
+event:ota process
+Light:LED mode -> 61
+
+record dynamic br 100
+light_set_color (255->0) (0->0) (0->0)
+[HTTPC] Received 688 Bytes
+otaoffset : 688
+Write 7013[409600]
+green take time 10 ms 0
+blue take time 10 ms 0
+[HTTPC] Received 688 Bytes
+otaoffset : 688
+Write 7701[409600]
+[HTTPC] Received 688 Bytes
+otaoffset : 688
+Write 8389[409600]
+[HTTPC] Received 688 Bytes
+otaoffset : 688
+Write 9077[409600]
+
+...
+
+Write 408805[409600]
+[HTTPC] Received 283 Bytes
+otaoffset : 283
+Write 409088[409600]
+
+Calculated SHA256 Checksum:F1E973BF45CF1D2F59D71FC05BAC66EA9641A308A096CC894B8E8B1CE2D1D07B
+Header SET SHA256 Checksum:12B2B062A3861B058A112B4440F3C00C199A4A4C1ACB28C0DC3A6DC6117F0312
+[OTA] [TCP] SHA256 NOT Correct
+[OTA] [TCP] prepare OTA partition info
+[OTA] [TCP] Update PARTITION, partition len is 409088
+[OTA] [TCP] Rebooting
+[HTTPC] Transfer finished. rx_content_len is 409600
+ota download is done!
+ota:push success event
+event:ota success
+UDP(sk 1) send status 15 bytes
+Light:LED mode -> 61
+
+light_set_color (213->0) (213->0) (213->255)
+light record color (0 0 255)
+red take time 500 ms 0
+green take time 500 ms 0
+blue take time 500 ms 255
+light save : R 0 G 0 B 255
+zj_userdata_write key=KEY_COLOR(3)
+(report):red   [56] -> [0]
+(report):green [30] -> [0]
+(report):blue  [31] -> [255]
+___________local report__________
+Starting bl602 now....
+Booting BL602 Chip...
