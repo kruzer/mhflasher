@@ -921,7 +921,7 @@ fun MainTabContent(
                     }
                     FlashPhase.DONE -> {
                         Text(
-                            "Upload complete. Device is rebooting.",
+                            "Flash sent. Wait 15-30 seconds for the device to appear on WiFi. If it does not show up, power-cycle it manually.",
                             style = MaterialTheme.typography.bodySmall,
                             color = MaterialTheme.colorScheme.primary
                         )

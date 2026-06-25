@@ -1,10 +1,13 @@
 # Magic Home Flasher (BL602)
 
 ## Introduction
-Magic Home Flasher is an Android application designed to flash Magic Home devices equipped with a RISC-V BL602 chip using the OpenBeken firmware available from the [OpenBeken_App project on GitHub](https://github.com/openshwprojects/OpenBK7231T_App). This tool simplifies the process of updating devices to use open-source firmware, enhancing their functionality and customizability.
+Magic Home Flasher is an Android application designed to flash BL602-based LED controllers using the OpenBeken firmware available from the [OpenBeken_App project on GitHub](https://github.com/openshwprojects/OpenBK7231T_App). It started with Magic Home devices and now also covers more firmware variants, including Zengge/ZJ and CozyLife devices, by supporting multiple OTA trigger methods.
 
 ## Features
-- **Simple Device Updating**: Select and flash devices with new firmware directly over the air. No soldering required
+- **Simple Device Updating**: Select and flash devices with new firmware directly over the air. No soldering required.
+- **Broader Device Support**: Supports the classic Magic Home/Zengge UDP AT command OTA path and an additional CozyLife TCP/5555 OTA trigger.
+- **Zengge OTA Header Patching**: Builds OTA files with the vendor header fields required by newer Zengge/ZJ firmware.
+- **Standard and Small Firmware Images**: Includes a full OpenBeken image and a smaller minimal image for devices that report only 1MB flash.
 - **Open Source**: Leverage and contribute to the open-source community.
 
 ## Getting Started
@@ -12,7 +15,7 @@ These instructions will guide you through the setup and operation of Magic Home 
 
 ### Prerequisites
 - An Android device running Android 29 or higher.
-- A Magic Home device with a BL602 chip within range.
+- A BL602-based device in pairing/AP mode, for example Magic Home, Zengge/ZJ, or CozyLife.
 
 ### Installation
 1. Download the latest release of Magic Home Flasher from the [Releases](https://github.com/kruzer/mhflasher/releases) section on GitHub.
@@ -20,16 +23,32 @@ These instructions will guide you through the setup and operation of Magic Home 
 
 ### Usage
 1. Open the Magic Home Flasher app.
-2. Tap on the **Scan Wifi Devices** button to discover available Wi-Fi networks.
-3. Look for networks named like `LEDnetXXXXXX`. These are typically broadcast by Magic Home devices.
-4. Select the network corresponding to the device you wish to flash.
-5. The app will automatically handle the OTA update process by serving the firmware over an internal HTTP server.
-6. Once the device downloads and applies the firmware, it will reboot automatically, running the new OpenBeken system.
+2. Tap **Scan for WiFi devices** to discover nearby device access points.
+3. Select the network corresponding to the device you want to flash. Magic Home/Zengge devices commonly use names like `LEDnetXXXXXX`; CozyLife devices commonly use names like `CozyLife_XXXX`.
+4. After connection, review the detected device details and the suggested flash plan.
+5. Choose the OTA trigger method if the default is not correct:
+   - **AT commands over UDP** for Magic Home and Zengge/ZJ firmware.
+   - **CozyLife TCP/5555** for CozyLife firmware.
+6. Choose the firmware image:
+   - **Standard OpenBeken** for normal flash sizes.
+   - **Small OpenBeken (1MB-safe)** for devices that report a 1MB flash. CozyLife devices often fall into this category, and the full OpenBeken image may not fit.
+7. Optionally preconfigure the target Wi-Fi SSID, password, and OpenBeken hostname before flashing.
+8. Start flashing. The app patches the firmware, builds an OTA image, serves it from the phone, and triggers the device to download it.
+9. After the upload finishes, wait 15-30 seconds for the device to reboot and join the configured network. If it does not appear, power-cycle it manually.
 
-<img src="img/Screenshot_20240422-001651_mhflasher.png" width="200">
+<p>
+  <img src="img/Screenshot_20260625-154946.png" width="240">
+  <img src="img/Screenshot_20260625-155142.png" width="240">
+</p>
 
 ## Firmware
 The firmware used by Magic Home Flasher is provided by the OpenBK7231T_App project. You can find more information and contribute to the firmware development at [OpenBeken_App GitHub Repository](https://github.com/openshwprojects/OpenBK7231T_App).
+
+The app currently bundles two BL602 OTA payload variants:
+- **Standard OpenBeken**: the normal full-featured build.
+- **Small OpenBeken**: a minimal build intended for devices with only 1MB flash, especially CozyLife devices where the standard image may be too large.
+
+Both variants are patched before flashing so Wi-Fi configuration can be injected and the BL602 OTA header contains the fields required by newer Zengge/ZJ firmware.
 
 ## Reverse engineer risc-v chip
 All info is based on the process of a reverse engineering the risc-v Bouffalo Labs chip bl602 described [here](reverse_engineer/README.md)
