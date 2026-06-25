@@ -36,9 +36,10 @@ All info is based on the process of a reverse engineering the risc-v Bouffalo La
 You can use a shell commands to achieve similar result:
 serve http file on port 1111:
 ```shell
+OTA_FILE=mhflasher/src/main/assets/OpenBL602_dev_20260618_214208_OTA_zengge.bin.xz.ota
 {
-    echo -ne "HTTP/1.0 200 OK\r\nContent-Length: "$(wc -c < OpenBL602_1.17.551_OTA.bin.xz.ota)"\r\n\r\n"
-    cat  OpenBL602_1.17.551_OTA.bin.xz.ota 
+    echo -ne "HTTP/1.0 200 OK\r\nContent-Length: "$(wc -c < "$OTA_FILE")"\r\n\r\n"
+    cat "$OTA_FILE"
 } | nc -l 1111
 ```
 invoke flashing process (from another terminal):
