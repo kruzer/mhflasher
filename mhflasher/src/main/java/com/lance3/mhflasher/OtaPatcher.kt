@@ -10,6 +10,7 @@ import java.util.zip.CRC32
 object OtaPatcher {
 
     private val MAGIC = byteArrayOf(0x4f, 0x42, 0x4b, 0x43, 0x46, 0x47, 0x31, 0x00) // "OBKCFG1\0"
+    private val ZENGGE_HEADER_JSON = """{"enc":0,"force":"true"}""".toByteArray(Charsets.UTF_8)
     const val STRUCT_SIZE = 276
 
     fun buildOtaFile(
@@ -46,6 +47,7 @@ object OtaPatcher {
         } else rawPayload
         val xzBytes = xzCompress(patched)
 
+        require(headerTemplate.size >= 0x200) { "OTA header template must be at least 512 bytes" }
         val header = headerTemplate.copyOfRange(0, 0x200)
 
         // payload length at 0x14-0x17 LE
@@ -58,6 +60,12 @@ object OtaPatcher {
         // SHA256 at 0x40-0x5f
         val sha256 = MessageDigest.getInstance("SHA-256").digest(xzBytes)
         sha256.copyInto(header, 0x40)
+
+        // Zengge/ZJ firmware validates a vendor extension at 0x100. Older Magic Home
+        // firmware ignores this area, so writing plaintext JSON keeps both paths valid.
+        header.fill(0x00, 0x100, 0x200)
+        header[0x100] = 0x00 // XOR key; 0 means the JSON below is plaintext.
+        ZENGGE_HEADER_JSON.copyInto(header, 0x101)
 
         return header + xzBytes
     }

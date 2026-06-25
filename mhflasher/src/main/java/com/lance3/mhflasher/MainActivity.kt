@@ -1,6 +1,7 @@
 package com.lance3.mhflasher
 
 import ApViewModel
+import FirmwareImage
 import LogViewModel
 import WifiAP
 import android.Manifest
@@ -27,6 +28,7 @@ import androidx.annotation.RequiresApi
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.ColumnScope
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
@@ -50,7 +52,9 @@ import androidx.compose.material3.Divider
 import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedTextField
+import androidx.compose.material3.RadioButton
 import androidx.compose.material3.Surface
+import androidx.compose.material3.Switch
 import androidx.compose.material3.Tab
 import androidx.compose.material3.TabRow
 import androidx.compose.material3.Text
@@ -72,6 +76,7 @@ import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.unit.sp
 import androidx.compose.ui.unit.dp
 import androidx.activity.viewModels
+import androidx.compose.runtime.LaunchedEffect
 import androidx.core.app.ActivityCompat
 import androidx.core.content.ContextCompat
 import com.lance3.mhflasher.ui.theme.MagicHomeFlasherTheme
@@ -97,7 +102,7 @@ object Constants {
 enum class CMD(val str: String){
     INFO("HF-A11ASSISTHREAD"),
     VER("AT+LVER\n"),
-    OTA("AT+UPURL=http://10.10.123.4:${Constants.OTA_PORT}/update?version=33_00_dev_20260618_214208_OpenBeken&beta,${Constants.CODE_PLACEHOLDER}"),
+    OTA("AT+UPURL=http://10.10.123.4:${Constants.OTA_PORT}/update?version=33_00_dev_20260625_142543_OpenBeken&beta,${Constants.CODE_PLACEHOLDER}"),
     OTA_BETA("AT+UPURL=http://10.10.123.4:${Constants.OTA_PORT}/update?version=beta&beta,${Constants.CODE_PLACEHOLDER}"),
     OTA_BETA2("AT+UPURL=http://10.10.123.4:${Constants.OTA_PORT}/update?version=beta&x,${Constants.CODE_PLACEHOLDER}"),
     OTA_JSON("AT+UPURL={\"aes\":\"a50525456A\",\"url\":\"http://10.10.123.4:${Constants.OTA_PORT}/update\",\"ind\":0}\r\n")
@@ -119,7 +124,7 @@ class MainActivity : ComponentActivity() {
         Log.d("LOG","On create")
         setContent {
             MagicHomeFlasherTheme {
-                MyApp(logViewModel, apViewModel, {wifiCheckAndScan()}, {ap -> wifiConnect(ap)},{ip -> checkDeviceByIP(ip)}, {cmd -> prepareOtaAndFlash(applicationContext, OtaTrigger.AT_UPURL, cmd)}, {trigger -> prepareOtaAndFlash(applicationContext, trigger)}, {wifiReadConfig()}, {wifiSetAndReboot()})
+                MyApp(logViewModel, apViewModel, {wifiCheckAndScan()}, {ap -> wifiConnect(ap)},{ip -> checkDeviceByIP(ip)}, {trigger -> prepareOtaAndFlash(applicationContext, trigger)}, {wifiReadConfig()}, {wifiSetAndReboot()})
             }
         }
         startHttpServer(applicationContext)
@@ -566,17 +571,23 @@ class MainActivity : ComponentActivity() {
         mainThread { apViewModel.flashPhase.value = FlashPhase.PATCHING }
         Thread {
             try {
-                logViewModel.addLog("Preparing firmware: patching config...")
-                val rawPayload = context.assets.open("OpenBL602_small_20260624_9_OTA.bin").readBytes()
-                val headerTemplate = context.assets.open("OpenBL602_dev_20260618_214208_OTA_zengge.bin.xz.ota").readBytes()
+                val image = apViewModel.firmwareImage.value
+                val rawPayloadAsset = when (image) {
+                    FirmwareImage.STANDARD -> "OpenBL602_dev_20260625_142543_OTA.bin"
+                    FirmwareImage.SMALL -> "OpenBL602_small_20260625_1424_OTA.bin"
+                }
+                logViewModel.addLog("Preparing firmware: $image, patching config...")
+                val rawPayload = context.assets.open(rawPayloadAsset).readBytes()
+                val headerTemplate = context.assets.open("bl602_zengge_ota_header.bin").readBytes()
 
                 mainThread { apViewModel.flashPhase.value = FlashPhase.COMPRESSING }
                 logViewModel.addLog("Compressing (XZ)... this may take a few seconds")
+                val injectWifi = apViewModel.preconfigureWifi.value
                 val built = OtaPatcher.buildOtaFile(
                     rawPayload, headerTemplate,
-                    apViewModel.wifiSsid.value,
-                    apViewModel.wifiPassword.value,
-                    apViewModel.wifiHostname.value,
+                    if (injectWifi) apViewModel.wifiSsid.value else "",
+                    if (injectWifi) apViewModel.wifiPassword.value else "",
+                    if (injectWifi) apViewModel.wifiHostname.value else "",
                     log = { logViewModel.addLog(it) }
                 )
                 apViewModel.otaBytes = built
@@ -631,8 +642,7 @@ fun MyApp(
     onScanClick: () -> Unit,
     onConnectClick: (WifiAP) -> kotlin.Unit,
     onCheckDeviceClick: (String) -> Unit,
-    onFlashClick: (CMD) -> Unit,
-    onFlashTcpOtaClick: (OtaTrigger) -> Unit,
+    onFlashClick: (OtaTrigger) -> Unit,
     onWifiReadClick: () -> Unit,
     onWifiSetClick: () -> Unit,
     selTab: Int = 0
@@ -649,7 +659,7 @@ fun MyApp(
             }
         }
         when (tabIndex) {
-            0 -> MainTabContent(logViewModel,apViewModel,onScanClick,onConnectClick, onCheckDeviceClick, onFlashClick, onFlashTcpOtaClick, onWifiReadClick, onWifiSetClick)
+            0 -> MainTabContent(logViewModel,apViewModel,onScanClick,onConnectClick, onCheckDeviceClick, onFlashClick, onWifiReadClick, onWifiSetClick)
             1 -> LogTabContent(logViewModel)
         }
     }
@@ -691,88 +701,156 @@ fun MainTabContent(
     onScanClick: () -> Unit,
     onConnectClick: (WifiAP) -> Unit,
     onCheckDeviceClick: (String) -> Unit,
-    onFlashClick: (CMD) -> Unit,
-    onFlashTcpOtaClick: (OtaTrigger) -> Unit,
+    onFlashClick: (OtaTrigger) -> Unit,
     onWifiReadClick: () -> Unit,
     onWifiSetClick: () -> Unit
 ) {
-    val ssid = apViewModel.wifiSsid.value
-    val autoConfig = ssid.isNotEmpty()
+    val connectedAp = apViewModel.connectedAP.value
+    val looksCozyLife = isCozyLifeAp(connectedAp)
+    var flashMethod by remember(connectedAp) {
+        mutableStateOf(if (looksCozyLife) OtaTrigger.TCP_OTA else OtaTrigger.AT_UPURL)
+    }
+    val preconfigureWifi = apViewModel.preconfigureWifi.value
+    val targetSsid = apViewModel.wifiSsid.value
+    val suggestedHostname = suggestedHostnameFromAp(connectedAp)
+    val hasDeviceConnection = apViewModel.remoteIP.value.isNotEmpty() || apViewModel.localIP.value.isNotEmpty()
+    val phase = apViewModel.flashPhase.value
+    val isFlashing = phase != FlashPhase.IDLE && phase != FlashPhase.DONE && phase != FlashPhase.ERROR
+
+    LaunchedEffect(connectedAp) {
+        if (connectedAp.isNotBlank() && apViewModel.wifiHostname.value.isBlank()) {
+            apViewModel.wifiHostname.value = suggestedHostname
+            apViewModel.saveWifiConfig()
+        }
+        if (connectedAp.isNotBlank()) {
+            apViewModel.firmwareImage.value = if (looksCozyLife) FirmwareImage.SMALL else FirmwareImage.STANDARD
+        }
+    }
 
     Column(
         modifier = Modifier
             .fillMaxSize()
             .verticalScroll(rememberScrollState())
-            .padding(horizontal = 12.dp, vertical = 8.dp),
-        verticalArrangement = Arrangement.spacedBy(12.dp),
-        horizontalAlignment = Alignment.CenterHorizontally
+            .padding(horizontal = 14.dp, vertical = 10.dp),
+        verticalArrangement = Arrangement.spacedBy(14.dp)
     ) {
-        // --- Device discovery card ---
-        Card(modifier = Modifier.fillMaxWidth()) {
-            Column(modifier = Modifier.padding(12.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {
-                Text("Device discovery", style = MaterialTheme.typography.titleSmall)
-                Spacer(Modifier.height(4.dp))
+        SectionCard("1. Connect") {
+            val uniqueAPs = apViewModel.accessPoints
+                .groupBy { it.name }
+                .map { (_, list) -> list.maxBy { it.rssi } }
+                .sortedByDescending { it.rssi }
 
-                val uniqueAPs = apViewModel.accessPoints
-                    .groupBy { it.name }
-                    .map { (_, list) -> list.maxBy { it.rssi } }
-                    .sortedByDescending { it.rssi }
-
-                if (uniqueAPs.isEmpty()) {
-                    Text(
-                        "No devices found. Tap Scan to search.",
-                        style = MaterialTheme.typography.bodySmall,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant,
-                        modifier = Modifier.padding(vertical = 4.dp)
-                    )
-                } else {
-                    uniqueAPs.forEach { ap ->
-                        Row(
-                            modifier = Modifier
-                                .fillMaxWidth()
-                                .clickable { onConnectClick(ap) }
-                                .padding(vertical = 10.dp, horizontal = 4.dp),
-                            horizontalArrangement = Arrangement.SpaceBetween,
-                            verticalAlignment = Alignment.CenterVertically
-                        ) {
-                            Text(ap.name, style = MaterialTheme.typography.bodyLarge, fontWeight = FontWeight.Medium)
-                            Text(
-                                text = signalBars(ap.rssi) + "  ${ap.rssi} dBm",
-                                style = MaterialTheme.typography.bodyMedium,
-                                color = MaterialTheme.colorScheme.onSurfaceVariant
-                            )
-                        }
-                        Divider(color = MaterialTheme.colorScheme.outlineVariant, thickness = 0.5.dp)
+            if (uniqueAPs.isEmpty()) {
+                Text(
+                    if (connectedAp.isBlank()) "No devices found. Scan for nearby BL602 access points."
+                    else "Connected to $connectedAp",
+                    style = MaterialTheme.typography.bodyMedium,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
+            } else {
+                uniqueAPs.forEach { ap ->
+                    AccessPointRow(ap = ap, selected = ap.name == connectedAp) {
+                        onConnectClick(ap)
                     }
                 }
+            }
 
-                Spacer(Modifier.height(4.dp))
-                Button(
-                    onClick = { logViewModel.addLog("clicked scan"); onScanClick() },
-                    modifier = Modifier.fillMaxWidth()
-                ) {
-                    Text("Scan for WiFi device")
-                }
-                DeviceDetailsTable(apViewModel)
+            Button(
+                onClick = { logViewModel.addLog("clicked scan"); onScanClick() },
+                modifier = Modifier.fillMaxWidth()
+            ) {
+                Text("Scan for WiFi devices")
             }
         }
 
-        if (apViewModel.firmwareVersion.value.isNotEmpty() || apViewModel.remoteIP.value.isNotEmpty()) {
+        if (hasDeviceConnection) {
+            SectionCard("2. Diagnose") {
+                Text(
+                    inferredDeviceSummary(connectedAp, apViewModel.firmwareVersion.value),
+                    style = MaterialTheme.typography.bodyMedium,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
 
-            // --- Flash card ---
-            Card(modifier = Modifier.fillMaxWidth()) {
-                Column(modifier = Modifier.padding(12.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
-                    Text("Target WiFi network", style = MaterialTheme.typography.titleSmall)
-                    Text(
-                        "Fill SSID and password to pre-configure WiFi — after flashing the device will automatically connect to this network. Leave empty to use the standard OpenBeken pairing procedure (AP mode).",
-                        style = MaterialTheme.typography.bodySmall,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                KeyValueGrid(
+                    "Device AP" to connectedAp.ifBlank { "-" },
+                    "Device IP" to apViewModel.remoteIP.value.ifBlank { "-" },
+                    "Phone IP" to apViewModel.localIP.value.ifBlank { "-" },
+                    "Firmware" to apViewModel.firmwareVersion.value.ifBlank { "No AT response yet" },
+                    "Device ID" to apViewModel.deviceId.value.ifBlank { "-" },
+                    "MAC" to apViewModel.macAddress.value.ifBlank { "-" }
+                )
+
+                if (apViewModel.remoteIP.value.isNotBlank()) {
+                    FilledTonalButton(
+                        onClick = { onCheckDeviceClick(apViewModel.remoteIP.value) },
+                        modifier = Modifier.fillMaxWidth()
+                    ) {
+                        Text("Retry AT discovery")
+                    }
+                }
+            }
+
+            SectionCard("3. Flash Plan") {
+                Text("Start method", style = MaterialTheme.typography.titleSmall)
+                OptionRow(
+                    title = "AT commands over UDP",
+                    subtitle = "Magic Home / Zengge path, port 48899, AT+UPURL.",
+                    selected = flashMethod == OtaTrigger.AT_UPURL,
+                    onClick = { flashMethod = OtaTrigger.AT_UPURL }
+                )
+                OptionRow(
+                    title = "CozyLife TCP/5555",
+                    subtitle = "JSON cmd=5 trigger used by CozyLife firmware.",
+                    selected = flashMethod == OtaTrigger.TCP_OTA,
+                    onClick = { flashMethod = OtaTrigger.TCP_OTA }
+                )
+
+                Divider()
+
+                Text("Firmware image", style = MaterialTheme.typography.titleSmall)
+                OptionRow(
+                    title = "Standard OpenBeken",
+                    subtitle = "Full 20260625 build. Supports OTA header patching and WiFi injection.",
+                    selected = apViewModel.firmwareImage.value == FirmwareImage.STANDARD,
+                    onClick = { apViewModel.firmwareImage.value = FirmwareImage.STANDARD }
+                )
+                OptionRow(
+                    title = "Small OpenBeken (1MB-safe)",
+                    subtitle = "Smaller 20260625 build for CozyLife devices with limited flash.",
+                    selected = apViewModel.firmwareImage.value == FirmwareImage.SMALL,
+                    onClick = { apViewModel.firmwareImage.value = FirmwareImage.SMALL }
+                )
+
+                Divider()
+
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Column(modifier = Modifier.weight(1f)) {
+                        Text("Preconfigure WiFi", style = MaterialTheme.typography.titleSmall)
+                        Text(
+                            if (preconfigureWifi) "OpenBeken will try to join the target network after flashing."
+                            else "Leave off to use the normal OpenBeken AP pairing mode.",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant
+                        )
+                    }
+                    Switch(
+                        checked = preconfigureWifi,
+                        onCheckedChange = {
+                            apViewModel.preconfigureWifi.value = it
+                            apViewModel.saveWifiConfig()
+                        }
                     )
+                }
 
+                if (preconfigureWifi) {
                     OutlinedTextField(
                         value = apViewModel.wifiSsid.value,
                         onValueChange = { apViewModel.wifiSsid.value = it; apViewModel.saveWifiConfig() },
-                        label = { Text("SSID") },
+                        label = { Text("Target SSID") },
                         singleLine = true,
                         textStyle = TextStyle(color = MaterialTheme.colorScheme.onSurface),
                         modifier = Modifier.fillMaxWidth()
@@ -780,7 +858,7 @@ fun MainTabContent(
                     OutlinedTextField(
                         value = apViewModel.wifiPassword.value,
                         onValueChange = { apViewModel.wifiPassword.value = it; apViewModel.saveWifiConfig() },
-                        label = { Text("Password") },
+                        label = { Text("Target password") },
                         singleLine = true,
                         visualTransformation = PasswordVisualTransformation(),
                         textStyle = TextStyle(color = MaterialTheme.colorScheme.onSurface),
@@ -789,107 +867,218 @@ fun MainTabContent(
                     OutlinedTextField(
                         value = apViewModel.wifiHostname.value,
                         onValueChange = { apViewModel.wifiHostname.value = it; apViewModel.saveWifiConfig() },
-                        label = { Text("Hostname (optional)") },
+                        label = { Text("OpenBeken hostname") },
                         singleLine = true,
                         textStyle = TextStyle(color = MaterialTheme.colorScheme.onSurface),
                         modifier = Modifier.fillMaxWidth()
                     )
+                }
 
-                    // Mode banner
-                    Surface(
-                        shape = MaterialTheme.shapes.small,
-                        color = if (autoConfig) MaterialTheme.colorScheme.primaryContainer
-                                else MaterialTheme.colorScheme.surfaceVariant,
-                        modifier = Modifier.fillMaxWidth()
-                    ) {
-                        Text(
-                            text = if (autoConfig) "After flash: auto-connect to \"$ssid\""
-                                   else "After flash: standard OpenBeken pairing (AP mode)",
-                            style = MaterialTheme.typography.bodySmall,
-                            color = if (autoConfig) MaterialTheme.colorScheme.onPrimaryContainer
-                                    else MaterialTheme.colorScheme.onSurfaceVariant,
-                            modifier = Modifier.padding(horizontal = 12.dp, vertical = 8.dp)
+                Surface(
+                    shape = MaterialTheme.shapes.small,
+                    color = MaterialTheme.colorScheme.surfaceVariant,
+                    modifier = Modifier.fillMaxWidth()
+                ) {
+                    Column(modifier = Modifier.padding(12.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                        SummaryLine("Method", if (flashMethod == OtaTrigger.TCP_OTA) "CozyLife TCP/5555" else "AT UDP")
+                        SummaryLine(
+                            "Image",
+                            if (apViewModel.firmwareImage.value == FirmwareImage.SMALL) "Small OpenBeken"
+                            else "Standard OpenBeken"
+                        )
+                        SummaryLine(
+                            "WiFi",
+                            if (preconfigureWifi && targetSsid.isNotBlank()) "preconfigure $targetSsid"
+                            else "OpenBeken AP pairing"
                         )
                     }
+                }
 
-                    Divider()
+                Button(
+                    onClick = { if (!isFlashing) onFlashClick(flashMethod) },
+                    enabled = !isFlashing && (!preconfigureWifi || targetSsid.isNotBlank()),
+                    modifier = Modifier.fillMaxWidth()
+                ) {
+                    Text("Flash OpenBeken")
+                }
 
-                    val phase = apViewModel.flashPhase.value
-                    val isFlashing = phase != FlashPhase.IDLE && phase != FlashPhase.DONE && phase != FlashPhase.ERROR
-
-                    Button(
-                        onClick = { if (!isFlashing) onFlashClick(CMD.OTA_BETA) },
-                        enabled = !isFlashing,
-                        modifier = Modifier.fillMaxWidth()
-                    ) {
-                        Text(if (autoConfig) "Flash OpenBeken + WiFi config (AT)" else "Flash OpenBeken (AT)")
+                when (phase) {
+                    FlashPhase.PATCHING -> {
+                        FlashStatusRow("1/3  Patching firmware config...", indeterminate = true)
                     }
-
-                    FilledTonalButton(
-                        onClick = { if (!isFlashing) onFlashTcpOtaClick(OtaTrigger.TCP_OTA) },
-                        enabled = !isFlashing,
-                        modifier = Modifier.fillMaxWidth()
-                    ) {
-                        Text(if (autoConfig) "Flash OpenBeken + WiFi config (CozyLife TCP/5555)" else "Flash OpenBeken (CozyLife TCP/5555)")
+                    FlashPhase.COMPRESSING -> {
+                        FlashStatusRow("2/3  Compressing (XZ)...", indeterminate = true)
                     }
-
-                    when (phase) {
-                        FlashPhase.PATCHING -> {
-                            FlashStatusRow("1/3  Patching firmware config...", indeterminate = true)
-                        }
-                        FlashPhase.COMPRESSING -> {
-                            FlashStatusRow("2/3  Compressing (XZ)...", indeterminate = true)
-                        }
-                        FlashPhase.READY -> {
-                            FlashStatusRow("3/3  Sending command to device...", indeterminate = true)
-                        }
-                        FlashPhase.UPLOADING -> {
-                            FlashStatusRow(
-                                "Uploading firmware  ${(apViewModel.flashProgress.value * 100).toInt()}%",
-                                indeterminate = false,
-                                progress = apViewModel.flashProgress.value
-                            )
-                        }
-                        FlashPhase.DONE -> {
-                            Text(
-                                "Upload complete. Device is rebooting.",
-                                style = MaterialTheme.typography.bodySmall,
-                                color = MaterialTheme.colorScheme.primary
-                            )
-                        }
-                        FlashPhase.ERROR -> {
-                            Text(
-                                "Error — check log tab for details.",
-                                style = MaterialTheme.typography.bodySmall,
-                                color = MaterialTheme.colorScheme.error
-                            )
-                        }
-                        else -> {}
+                    FlashPhase.READY -> {
+                        FlashStatusRow("3/3  Sending command to device...", indeterminate = true)
                     }
+                    FlashPhase.UPLOADING -> {
+                        FlashStatusRow(
+                            "Uploading firmware  ${(apViewModel.flashProgress.value * 100).toInt()}%",
+                            indeterminate = false,
+                            progress = apViewModel.flashProgress.value
+                        )
+                    }
+                    FlashPhase.DONE -> {
+                        Text(
+                            "Upload complete. Device is rebooting.",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.primary
+                        )
+                    }
+                    FlashPhase.ERROR -> {
+                        Text(
+                            "Error - check log tab for details.",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.error
+                        )
+                    }
+                    else -> {}
                 }
             }
 
-            // --- Live AT config card ---
-            Card(modifier = Modifier.fillMaxWidth()) {
-                Column(modifier = Modifier.padding(12.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                    Text("Live WiFi config (AT commands)", style = MaterialTheme.typography.titleSmall)
-                    Text(
-                        "Read or set WiFi credentials on an already-running OpenBeken device via UDP AT commands.",
-                        style = MaterialTheme.typography.bodySmall,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant
-                    )
-                    Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                        FilledTonalButton(onClick = { onWifiReadClick() }, modifier = Modifier.weight(1f)) {
-                            Text("Read config")
-                        }
-                        FilledTonalButton(onClick = { onWifiSetClick() }, modifier = Modifier.weight(1f)) {
-                            Text("Set & Reboot")
-                        }
+            SectionCard("Advanced") {
+                Text(
+                    "Read or set WiFi credentials on an already-running OpenBeken device via UDP AT commands.",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
+                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    FilledTonalButton(onClick = { onWifiReadClick() }, modifier = Modifier.weight(1f)) {
+                        Text("Read config")
+                    }
+                    FilledTonalButton(onClick = { onWifiSetClick() }, modifier = Modifier.weight(1f)) {
+                        Text("Set & Reboot")
                     }
                 }
             }
         }
     }
+}
+
+@Composable
+fun SectionCard(title: String, content: @Composable ColumnScope.() -> Unit) {
+    Card(
+        modifier = Modifier.fillMaxWidth(),
+        colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface)
+    ) {
+        Column(
+            modifier = Modifier.padding(14.dp),
+            verticalArrangement = Arrangement.spacedBy(10.dp)
+        ) {
+            Text(title, style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.SemiBold)
+            content()
+        }
+    }
+}
+
+@Composable
+fun AccessPointRow(ap: WifiAP, selected: Boolean, onClick: () -> Unit) {
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .clickable { onClick() }
+            .padding(vertical = 9.dp),
+        horizontalArrangement = Arrangement.SpaceBetween,
+        verticalAlignment = Alignment.CenterVertically
+    ) {
+        Column(modifier = Modifier.weight(1f)) {
+            Text(ap.name, style = MaterialTheme.typography.bodyLarge, fontWeight = FontWeight.Medium)
+            if (selected) {
+                Text("Connected", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.primary)
+            }
+        }
+        Text(
+            text = signalBars(ap.rssi) + "  ${ap.rssi} dBm",
+            style = MaterialTheme.typography.bodyMedium,
+            color = MaterialTheme.colorScheme.onSurfaceVariant
+        )
+    }
+    Divider(color = MaterialTheme.colorScheme.outlineVariant, thickness = 0.5.dp)
+}
+
+@Composable
+fun OptionRow(
+    title: String,
+    subtitle: String,
+    selected: Boolean,
+    enabled: Boolean = true,
+    onClick: () -> Unit
+) {
+    val container = when {
+        selected -> MaterialTheme.colorScheme.primaryContainer
+        else -> MaterialTheme.colorScheme.surfaceVariant
+    }
+    Surface(
+        shape = MaterialTheme.shapes.small,
+        color = container,
+        modifier = Modifier
+            .fillMaxWidth()
+            .clickable(enabled = enabled) { onClick() }
+    ) {
+        Row(
+            modifier = Modifier.padding(horizontal = 10.dp, vertical = 8.dp),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(8.dp)
+        ) {
+            RadioButton(selected = selected, enabled = enabled, onClick = onClick)
+            Column(modifier = Modifier.weight(1f)) {
+                Text(
+                    title,
+                    style = MaterialTheme.typography.bodyMedium,
+                    fontWeight = FontWeight.Medium,
+                    color = if (enabled) MaterialTheme.colorScheme.onSurface else MaterialTheme.colorScheme.onSurfaceVariant
+                )
+                Text(
+                    subtitle,
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
+            }
+        }
+    }
+}
+
+@Composable
+fun KeyValueGrid(vararg items: Pair<String, String>) {
+    Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
+        items.forEach { (key, value) ->
+            SummaryLine(key, value)
+        }
+    }
+}
+
+@Composable
+fun SummaryLine(label: String, value: String) {
+    Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+        Text(
+            "$label:",
+            modifier = Modifier.width(92.dp),
+            style = MaterialTheme.typography.bodySmall,
+            fontWeight = FontWeight.SemiBold,
+            color = MaterialTheme.colorScheme.onSurfaceVariant
+        )
+        Text(value, style = MaterialTheme.typography.bodySmall, modifier = Modifier.weight(1f))
+    }
+}
+
+fun isCozyLifeAp(apName: String): Boolean =
+    apName.startsWith("CozyLife", ignoreCase = true)
+
+fun inferredDeviceSummary(apName: String, firmwareVersion: String): String = when {
+    isCozyLifeAp(apName) -> "CozyLife-like BL602 AP detected. TCP/5555 and the small firmware image are selected by default."
+    firmwareVersion.isNotBlank() -> "AT commands responded. Magic Home / Zengge OTA path should be available."
+    apName.isNotBlank() -> "WiFi connection is active, but AT diagnostics have not confirmed the firmware yet."
+    else -> "Connect to a device AP to run basic diagnostics."
+}
+
+fun suggestedHostnameFromAp(apName: String): String {
+    val normalized = apName
+        .lowercase()
+        .replace(Regex("[^a-z0-9]+"), "-")
+        .trim('-')
+        .take(24)
+    return if (normalized.isBlank()) "openbeken" else "obk-$normalized"
 }
 /*
 Text("or", style = MaterialTheme.typography.titleMedium, modifier = Modifier.padding(vertical = 8.dp))

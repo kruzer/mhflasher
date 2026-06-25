@@ -15,6 +15,7 @@ import androidx.core.app.ActivityCompat
 import androidx.lifecycle.AndroidViewModel
 
 enum class FlashPhase { IDLE, PATCHING, COMPRESSING, READY, UPLOADING, DONE, ERROR }
+enum class FirmwareImage { STANDARD, SMALL }
 
 class ApViewModel(application: Application) : AndroidViewModel(application) {
     private val prefs = application.getSharedPreferences("mhflasher", Context.MODE_PRIVATE)
@@ -29,14 +30,17 @@ class ApViewModel(application: Application) : AndroidViewModel(application) {
     var remoteIP = mutableStateOf("")
     var flashProgress = mutableStateOf(0.0f)
     var flashPhase = mutableStateOf(FlashPhase.IDLE)
+    var firmwareImage = mutableStateOf(FirmwareImage.SMALL)
     var otaBytes: ByteArray? = null
     var useNewOtaFormat = mutableStateOf(false)
+    var preconfigureWifi = mutableStateOf(prefs.getBoolean("preconfigureWifi", false))
     var wifiSsid = mutableStateOf(prefs.getString("ssid", "") ?: "")
     var wifiPassword = mutableStateOf(prefs.getString("password", "") ?: "")
     var wifiHostname = mutableStateOf(prefs.getString("hostname", "") ?: "")
 
     fun saveWifiConfig() {
         prefs.edit()
+            .putBoolean("preconfigureWifi", preconfigureWifi.value)
             .putString("ssid", wifiSsid.value)
             .putString("password", wifiPassword.value)
             .putString("hostname", wifiHostname.value)

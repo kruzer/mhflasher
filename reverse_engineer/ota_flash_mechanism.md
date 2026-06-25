@@ -78,8 +78,8 @@ The current flow builds the OTA file dynamically from:
 
 - the small OpenBeken payload `OpenBL602_small_..._OTA.bin`, which fits CozyLife
   devices with 1MB flash;
-- the header template `OpenBL602_dev_..._OTA_zengge.bin.xz.ota`, which fixed OTA
-  acceptance on ZengGe firmware;
+- the 512-byte header template `bl602_zengge_ota_header.bin`, extracted from a
+  known-good `.bin.xz.ota` file, which fixed OTA acceptance on ZengGe firmware;
 - optional injected WiFi configuration stored in the `OBKCFG1` structure.
 
 ### Integrity Check
@@ -114,10 +114,10 @@ HTTP transfer path without risking a brick.
 
 ## OTA File Location in the Project
 
-`mhflasher/src/main/assets/OpenBL602_<version>_OTA.bin.xz.ota`
+`mhflasher/src/main/assets/OpenBL602_<version>_OTA.bin`
 
 When updating to a new version:
 
-1. Copy the new `.bin.xz.ota` file or raw OTA payload to `assets/`.
+1. Copy the new raw OTA payload (`*_OTA.bin`) to `assets/`.
 2. Update the filename in `MainActivity.kt` where `context.assets.open(...)` is used.
 3. Update the version string in `CMD.OTA`; it is informational and used for logs.
