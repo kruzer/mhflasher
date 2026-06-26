@@ -382,14 +382,20 @@ class MainActivity : ComponentActivity() {
         }.start()
     }
 
-    private fun flashDevice(cmd: CMD = CMD.OTA) {
+    private fun flashDevice() {
         val inetAddress = convertToInetAddress(apViewModel.remoteIP.value)
         if (inetAddress != null) {
-            logViewModel.addLog("Flash cmd: ${cmd.name}")
-            sendUdpPacket(inetAddress, Constants.CMD_PORT, cmd)
+            val cmd = buildAtOtaCommand()
+            logViewModel.addLog("Flash cmd: $cmd")
+            sendUdpPacket(inetAddress, Constants.CMD_PORT, cmd, isOta = true)
         } else {
             logViewModel.addLog("Invalid IP address: ${apViewModel.remoteIP.value}")
         }
+    }
+
+    private fun buildAtOtaCommand(): String {
+        val localIp = apViewModel.localIP.value.ifBlank { "10.10.123.4" }
+        return "AT+UPURL=http://$localIp:${Constants.OTA_PORT}/update?version=beta_33_00_ZG-BL&beta,${Constants.CODE_PLACEHOLDER}"
     }
 
     private fun flashDeviceTcpOta() {
@@ -435,23 +441,32 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun sendUdpPacket(ip: InetAddress, port: Int, cmd: CMD) {
+        sendUdpPacket(
+            ip = ip,
+            port = port,
+            cmd = cmd.str,
+            isOta = cmd == CMD.OTA || cmd == CMD.OTA_BETA || cmd == CMD.OTA_BETA2 || cmd == CMD.OTA_JSON,
+            enumCmd = cmd
+        )
+    }
+
+    private fun sendUdpPacket(ip: InetAddress, port: Int, cmd: String, isOta: Boolean, enumCmd: CMD? = null) {
         val thread = Thread {
             try {
-                val buffer = cmd.str.toByteArray()
+                val buffer = cmd.toByteArray()
                 val packet = DatagramPacket(buffer, buffer.size, ip, port)
                 DatagramSocket().use { socket ->
                     socket.send(packet)
                     val receiveBuffer = ByteArray(1024)
                     val receivePacket = DatagramPacket(receiveBuffer, receiveBuffer.size)
 
-                    val isOta = cmd == CMD.OTA || cmd == CMD.OTA_BETA || cmd == CMD.OTA_BETA2 || cmd == CMD.OTA_JSON
                     socket.soTimeout = if (isOta) 30000 else 2000
 
                     try {
                         if (!isOta) {
                             socket.receive(receivePacket)
                             val receivedText = String(receivePacket.data, 0, receivePacket.length)
-                            when (cmd) {
+                            when (enumCmd) {
                                 CMD.INFO -> {
                                     checkUDP1_a11(receivedText)
                                     sendUdpPacket(ip, port, CMD.VER)
@@ -565,8 +580,7 @@ class MainActivity : ComponentActivity() {
 
     private fun prepareOtaAndFlash(
         context: Context,
-        trigger: OtaTrigger,
-        cmd: CMD = CMD.OTA_BETA
+        trigger: OtaTrigger
     ) {
         mainThread { apViewModel.flashPhase.value = FlashPhase.PATCHING }
         Thread {
@@ -574,7 +588,7 @@ class MainActivity : ComponentActivity() {
                 val image = apViewModel.firmwareImage.value
                 val rawPayloadAsset = when (image) {
                     FirmwareImage.STANDARD -> "OpenBL602_dev_20260625_142543_OTA.bin"
-                    FirmwareImage.SMALL -> "OpenBL602_small_20260625_1424_OTA.bin"
+                    FirmwareImage.SMALL -> "OpenBL602_small_repart3_OTA.bin"
                 }
                 logViewModel.addLog("Preparing firmware: $image, patching config...")
                 val rawPayload = context.assets.open(rawPayloadAsset).readBytes()
@@ -612,7 +626,7 @@ class MainActivity : ComponentActivity() {
 
                 mainThread { apViewModel.flashPhase.value = FlashPhase.READY }
                 when (trigger) {
-                    OtaTrigger.AT_UPURL -> flashDevice(cmd)
+                    OtaTrigger.AT_UPURL -> flashDevice()
                     OtaTrigger.TCP_OTA -> flashDeviceTcpOta()
                 }
             } catch (e: Exception) {
