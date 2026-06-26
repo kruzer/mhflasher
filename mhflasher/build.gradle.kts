@@ -11,8 +11,8 @@ android {
         applicationId = "com.lance3.mhflasher"
         minSdk = 29
         targetSdk = 34
-        versionCode = 3
-        versionName = "0.3"
+        versionCode = 4
+        versionName = "0.3.1"
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
         vectorDrawables {
