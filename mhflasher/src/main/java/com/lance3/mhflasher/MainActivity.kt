@@ -98,7 +98,7 @@ object Constants {
     const val CMD_PORT = 48899
     const val CODE_PLACEHOLDER = "pierogi"
     const val TCP_OTA_FW_LIMIT = 0x55000
-    const val LN882H_OTA_ASSET = "OpenLN8825_1.18.295_ota.img"
+    const val LN882H_OTA_ASSET = "OpenLN882H_1.18.296_OTA.bin"
 }
 
 enum class CMD(val str: String){
@@ -864,7 +864,7 @@ fun MainTabContent(
                     onClick = { apViewModel.targetMcu.value = TargetMcu.BL602 }
                 )
                 OptionRow(
-                    title = "LN882H / LN8825",
+                    title = "LN882H",
                     subtitle = "Experimental CozyLife/DoHome path. Uses TCP/5555 and serves an LN OTA image as-is.",
                     selected = targetMcu == TargetMcu.LN882H,
                     onClick = {
@@ -914,7 +914,7 @@ fun MainTabContent(
                         modifier = Modifier.fillMaxWidth()
                     ) {
                         Text(
-                            "OpenLN8825 1.18.295 OTA image. The app normalizes the LN image header before serving it.",
+                            "OpenLN882H 1.18.296 OTA image. The app validates the LN image header before serving it.",
                             style = MaterialTheme.typography.bodySmall,
                             color = MaterialTheme.colorScheme.onSurfaceVariant,
                             modifier = Modifier.padding(12.dp)
@@ -983,11 +983,11 @@ fun MainTabContent(
                     modifier = Modifier.fillMaxWidth()
                 ) {
                     Column(modifier = Modifier.padding(12.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {
-                        SummaryLine("Target", if (targetMcu == TargetMcu.LN882H) "LN882H / LN8825" else "BL602")
+                        SummaryLine("Target", if (targetMcu == TargetMcu.LN882H) "LN882H" else "BL602")
                         SummaryLine("Method", if (flashMethod == OtaTrigger.TCP_OTA) "CozyLife TCP/5555" else "AT UDP")
                         SummaryLine(
                             "Image",
-                            if (targetMcu == TargetMcu.LN882H) "OpenLN8825"
+                            if (targetMcu == TargetMcu.LN882H) "OpenLN882H"
                             else if (apViewModel.firmwareImage.value == FirmwareImage.SMALL) "Small OpenBeken"
                             else "Standard OpenBeken"
                         )
@@ -1172,7 +1172,7 @@ fun isCozyLifeAp(apName: String): Boolean =
     apName.startsWith("CozyLife", ignoreCase = true)
 
 fun inferredDeviceSummary(apName: String, firmwareVersion: String): String = when {
-    isCozyLifeAp(apName) -> "CozyLife-like AP detected. TCP/5555 is selected by default; choose BL602 or LN882H/LN8825 depending on the hardware."
+    isCozyLifeAp(apName) -> "CozyLife-like AP detected. TCP/5555 is selected by default; choose BL602 or LN882H depending on the hardware."
     firmwareVersion.isNotBlank() -> "AT commands responded. Magic Home / Zengge OTA path should be available."
     apName.isNotBlank() -> "WiFi connection is active, but AT diagnostics have not confirmed the firmware yet."
     else -> "Connect to a device AP to run basic diagnostics."
