@@ -256,22 +256,37 @@ class MainActivity : ComponentActivity() {
 
             override fun onLinkPropertiesChanged(network: Network, linkProperties: LinkProperties) {
                 super.onLinkPropertiesChanged(network, linkProperties)
+                var localIp: String? = null
                 val addresses = linkProperties.linkAddresses
                 addresses.forEach {
                     if (it.address is Inet4Address) { // Filter for IPv4 address
                         logViewModel.addLog("got dhcp IPv4: ${it.address.hostAddress}")
                         apViewModel.isConnected.value = true
+                        localIp = it.address.hostAddress
                         apViewModel.localIP.value = it.address.hostAddress
                     }
                 }
+                val firstDnsServer = linkProperties.dnsServers.firstOrNull()?.hostAddress
                 val dnsServers = linkProperties.dnsServers
-                if (dnsServers.isNotEmpty()) {
-                    val firstDnsServer = dnsServers[0].hostAddress
-                    logViewModel.addLog("First DNS Server: $firstDnsServer")
-                    apViewModel.remoteIP.value = firstDnsServer
-                    sendUdpPacket(dnsServers[0],Constants.CMD_PORT, CMD.INFO)
+                val gateway = linkProperties.routes
+                    .firstOrNull { it.isDefaultRoute && it.gateway is Inet4Address }
+                    ?.gateway
+                    ?.hostAddress
+                val deviceIp = gateway ?: localIp?.substringBeforeLast('.')?.let { "$it.1" }
+                if (deviceIp != null) {
+                    logViewModel.addLog("Device gateway IP: $deviceIp${if (firstDnsServer != null) " (DNS=$firstDnsServer ignored)" else ""}")
+                    apViewModel.remoteIP.value = deviceIp
+                    val deviceAddress = convertToInetAddress(deviceIp)
+                    if (deviceAddress != null && apViewModel.targetMcu.value == TargetMcu.BL602 && !isCozyLifeAp(ap.name)) {
+                        sendUdpPacket(deviceAddress, Constants.CMD_PORT, CMD.INFO)
+                    } else {
+                        logViewModel.addLog("Skipping UDP AT discovery for TCP-only device path")
+                    }
                 } else {
-                    logViewModel.addLog("No DNS servers available")
+                    logViewModel.addLog("No device gateway IP available")
+                    if (dnsServers.isEmpty()) {
+                        logViewModel.addLog("No DNS servers available")
+                    }
                 }
             }
             override fun onUnavailable() {
@@ -824,13 +839,19 @@ fun MainTabContent(
                     "MAC" to apViewModel.macAddress.value.ifBlank { "-" }
                 )
 
-                if (apViewModel.remoteIP.value.isNotBlank()) {
+                if (apViewModel.remoteIP.value.isNotBlank() && targetMcu == TargetMcu.BL602) {
                     FilledTonalButton(
                         onClick = { onCheckDeviceClick(apViewModel.remoteIP.value) },
                         modifier = Modifier.fillMaxWidth()
                     ) {
                         Text("Retry AT discovery")
                     }
+                } else if (targetMcu == TargetMcu.LN882H) {
+                    Text(
+                        "LN882H uses TCP/5555; UDP AT discovery is skipped.",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
                 }
             }
 
@@ -1151,7 +1172,7 @@ fun isCozyLifeAp(apName: String): Boolean =
     apName.startsWith("CozyLife", ignoreCase = true)
 
 fun inferredDeviceSummary(apName: String, firmwareVersion: String): String = when {
-    isCozyLifeAp(apName) -> "CozyLife-like BL602 AP detected. TCP/5555 and the small firmware image are selected by default."
+    isCozyLifeAp(apName) -> "CozyLife-like AP detected. TCP/5555 is selected by default; choose BL602 or LN882H/LN8825 depending on the hardware."
     firmwareVersion.isNotBlank() -> "AT commands responded. Magic Home / Zengge OTA path should be available."
     apName.isNotBlank() -> "WiFi connection is active, but AT diagnostics have not confirmed the firmware yet."
     else -> "Connect to a device AP to run basic diagnostics."
