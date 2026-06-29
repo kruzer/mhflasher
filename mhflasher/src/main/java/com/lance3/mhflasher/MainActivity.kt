@@ -3,6 +3,7 @@ package com.lance3.mhflasher
 import ApViewModel
 import FirmwareImage
 import LogViewModel
+import TargetMcu
 import WifiAP
 import android.Manifest
 import android.content.BroadcastReceiver
@@ -97,6 +98,7 @@ object Constants {
     const val CMD_PORT = 48899
     const val CODE_PLACEHOLDER = "pierogi"
     const val TCP_OTA_FW_LIMIT = 0x55000
+    const val LN882H_OTA_ASSET = "OpenLN8825_1.18.295_ota.img"
 }
 
 enum class CMD(val str: String){
@@ -585,49 +587,70 @@ class MainActivity : ComponentActivity() {
         mainThread { apViewModel.flashPhase.value = FlashPhase.PATCHING }
         Thread {
             try {
-                val image = apViewModel.firmwareImage.value
-                val rawPayloadAsset = when (image) {
-                    FirmwareImage.STANDARD -> "OpenBL602_dev_20260625_142543_OTA.bin"
-                    FirmwareImage.SMALL -> "OpenBL602_small_repart3_OTA.bin"
-                }
-                logViewModel.addLog("Preparing firmware: $image, patching config...")
-                val rawPayload = context.assets.open(rawPayloadAsset).readBytes()
-                val headerTemplate = context.assets.open("bl602_zengge_ota_header.bin").readBytes()
+                when (apViewModel.targetMcu.value) {
+                    TargetMcu.BL602 -> {
+                        val image = apViewModel.firmwareImage.value
+                        val rawPayloadAsset = when (image) {
+                            FirmwareImage.STANDARD -> "OpenBL602_dev_20260625_142543_OTA.bin"
+                            FirmwareImage.SMALL -> "OpenBL602_small_repart3_OTA.bin"
+                        }
+                        logViewModel.addLog("Preparing BL602 firmware: $image, patching config...")
+                        val rawPayload = context.assets.open(rawPayloadAsset).readBytes()
+                        val headerTemplate = context.assets.open("bl602_zengge_ota_header.bin").readBytes()
 
-                mainThread { apViewModel.flashPhase.value = FlashPhase.COMPRESSING }
-                logViewModel.addLog("Compressing (XZ)... this may take a few seconds")
-                val injectWifi = apViewModel.preconfigureWifi.value
-                val built = OtaPatcher.buildOtaFile(
-                    rawPayload, headerTemplate,
-                    if (injectWifi) apViewModel.wifiSsid.value else "",
-                    if (injectWifi) apViewModel.wifiPassword.value else "",
-                    if (injectWifi) apViewModel.wifiHostname.value else "",
-                    log = { logViewModel.addLog(it) }
-                )
-                apViewModel.otaBytes = built
-                logViewModel.addLog("Firmware ready: ${built.size} bytes")
-                val otaPayloadLen = readLe32(built, 0x14)
-                if (trigger != OtaTrigger.AT_UPURL && otaPayloadLen > Constants.TCP_OTA_FW_LIMIT) {
-                    logViewModel.addLog(
-                        "TCP OTA image too large: payload $otaPayloadLen > FW ${Constants.TCP_OTA_FW_LIMIT} bytes"
-                    )
-                    mainThread { apViewModel.flashPhase.value = FlashPhase.ERROR }
-                    return@Thread
-                }
+                        mainThread { apViewModel.flashPhase.value = FlashPhase.COMPRESSING }
+                        logViewModel.addLog("Compressing (XZ)... this may take a few seconds")
+                        val injectWifi = apViewModel.preconfigureWifi.value
+                        val built = OtaPatcher.buildOtaFile(
+                            rawPayload, headerTemplate,
+                            if (injectWifi) apViewModel.wifiSsid.value else "",
+                            if (injectWifi) apViewModel.wifiPassword.value else "",
+                            if (injectWifi) apViewModel.wifiHostname.value else "",
+                            log = { logViewModel.addLog(it) }
+                        )
+                        apViewModel.otaBytes = built
+                        logViewModel.addLog("BL602 firmware ready: ${built.size} bytes")
+                        val otaPayloadLen = readLe32(built, 0x14)
+                        if (trigger != OtaTrigger.AT_UPURL && otaPayloadLen > Constants.TCP_OTA_FW_LIMIT) {
+                            logViewModel.addLog(
+                                "TCP OTA image too large: payload $otaPayloadLen > FW ${Constants.TCP_OTA_FW_LIMIT} bytes"
+                            )
+                            mainThread { apViewModel.flashPhase.value = FlashPhase.ERROR }
+                            return@Thread
+                        }
 
-                // save for inspection: adb pull /sdcard/Android/data/com.lance3.mhflasher/files/mhflasher_patched.bin.xz.ota
-                try {
-                    val outFile = java.io.File(context.getExternalFilesDir(null), "mhflasher_patched.bin.xz.ota")
-                    outFile.writeBytes(built)
-                    logViewModel.addLog("Saved: adb pull ${outFile.absolutePath}")
-                } catch (e: Exception) {
-                    logViewModel.addLog("Save failed: ${e.message}")
-                }
+                        // save for inspection: adb pull /sdcard/Android/data/com.lance3.mhflasher/files/mhflasher_patched.bin.xz.ota
+                        try {
+                            val outFile = java.io.File(context.getExternalFilesDir(null), "mhflasher_patched.bin.xz.ota")
+                            outFile.writeBytes(built)
+                            logViewModel.addLog("Saved: adb pull ${outFile.absolutePath}")
+                        } catch (e: Exception) {
+                            logViewModel.addLog("Save failed: ${e.message}")
+                        }
 
-                mainThread { apViewModel.flashPhase.value = FlashPhase.READY }
-                when (trigger) {
-                    OtaTrigger.AT_UPURL -> flashDevice()
-                    OtaTrigger.TCP_OTA -> flashDeviceTcpOta()
+                        mainThread { apViewModel.flashPhase.value = FlashPhase.READY }
+                        when (trigger) {
+                            OtaTrigger.AT_UPURL -> flashDevice()
+                            OtaTrigger.TCP_OTA -> flashDeviceTcpOta()
+                        }
+                    }
+
+                    TargetMcu.LN882H -> {
+                        logViewModel.addLog("Preparing LN882H OTA image...")
+                        val raw = context.assets.open(Constants.LN882H_OTA_ASSET).readBytes()
+                        val img = LnOtaImage.normalize(raw) { logViewModel.addLog(it) }
+                        val validationError = LnOtaImage.validate(img)
+                        if (validationError != null) {
+                            logViewModel.addLog("LN882H OTA image invalid: $validationError")
+                            mainThread { apViewModel.flashPhase.value = FlashPhase.ERROR }
+                            return@Thread
+                        }
+
+                        apViewModel.otaBytes = img
+                        logViewModel.addLog("LN882H image ready: ${img.size} bytes")
+                        mainThread { apViewModel.flashPhase.value = FlashPhase.READY }
+                        flashDeviceTcpOta()
+                    }
                 }
             } catch (e: Exception) {
                 logViewModel.addLog("Firmware preparation failed: ${e.message}")
@@ -721,6 +744,7 @@ fun MainTabContent(
 ) {
     val connectedAp = apViewModel.connectedAP.value
     val looksCozyLife = isCozyLifeAp(connectedAp)
+    val targetMcu = apViewModel.targetMcu.value
     var flashMethod by remember(connectedAp) {
         mutableStateOf(if (looksCozyLife) OtaTrigger.TCP_OTA else OtaTrigger.AT_UPURL)
     }
@@ -741,6 +765,12 @@ fun MainTabContent(
         }
     }
 
+    LaunchedEffect(targetMcu) {
+        if (targetMcu == TargetMcu.LN882H) {
+            flashMethod = OtaTrigger.TCP_OTA
+        }
+    }
+
     Column(
         modifier = Modifier
             .fillMaxSize()
@@ -756,7 +786,7 @@ fun MainTabContent(
 
             if (uniqueAPs.isEmpty()) {
                 Text(
-                    if (connectedAp.isBlank()) "No devices found. Scan for nearby BL602 access points."
+                    if (connectedAp.isBlank()) "No devices found. Scan for nearby BL602/LN882H access points."
                     else "Connected to $connectedAp",
                     style = MaterialTheme.typography.bodyMedium,
                     color = MaterialTheme.colorScheme.onSurfaceVariant
@@ -805,87 +835,125 @@ fun MainTabContent(
             }
 
             SectionCard("3. Flash Plan") {
+                Text("Target MCU", style = MaterialTheme.typography.titleSmall)
+                OptionRow(
+                    title = "BL602",
+                    subtitle = "Magic Home, Zengge/ZJ, and BL602 CozyLife devices.",
+                    selected = targetMcu == TargetMcu.BL602,
+                    onClick = { apViewModel.targetMcu.value = TargetMcu.BL602 }
+                )
+                OptionRow(
+                    title = "LN882H / LN8825",
+                    subtitle = "Experimental CozyLife/DoHome path. Uses TCP/5555 and serves an LN OTA image as-is.",
+                    selected = targetMcu == TargetMcu.LN882H,
+                    onClick = {
+                        apViewModel.targetMcu.value = TargetMcu.LN882H
+                        flashMethod = OtaTrigger.TCP_OTA
+                    }
+                )
+
+                Divider()
+
                 Text("Start method", style = MaterialTheme.typography.titleSmall)
                 OptionRow(
                     title = "AT commands over UDP",
                     subtitle = "Magic Home / Zengge path, port 48899, AT+UPURL.",
                     selected = flashMethod == OtaTrigger.AT_UPURL,
+                    enabled = targetMcu == TargetMcu.BL602,
                     onClick = { flashMethod = OtaTrigger.AT_UPURL }
                 )
                 OptionRow(
                     title = "CozyLife TCP/5555",
-                    subtitle = "JSON cmd=5 trigger used by CozyLife firmware.",
+                    subtitle = if (targetMcu == TargetMcu.LN882H) "Required for LN882H firmware." else "JSON cmd=5 trigger used by CozyLife firmware.",
                     selected = flashMethod == OtaTrigger.TCP_OTA,
                     onClick = { flashMethod = OtaTrigger.TCP_OTA }
                 )
 
                 Divider()
 
-                Text("Firmware image", style = MaterialTheme.typography.titleSmall)
-                OptionRow(
-                    title = "Standard OpenBeken",
-                    subtitle = "Full 20260625 build. Supports OTA header patching and WiFi injection.",
-                    selected = apViewModel.firmwareImage.value == FirmwareImage.STANDARD,
-                    onClick = { apViewModel.firmwareImage.value = FirmwareImage.STANDARD }
-                )
-                OptionRow(
-                    title = "Small OpenBeken (1MB-safe)",
-                    subtitle = "Smaller 20260625 build for CozyLife devices with limited flash.",
-                    selected = apViewModel.firmwareImage.value == FirmwareImage.SMALL,
-                    onClick = { apViewModel.firmwareImage.value = FirmwareImage.SMALL }
-                )
+                if (targetMcu == TargetMcu.BL602) {
+                    Text("Firmware image", style = MaterialTheme.typography.titleSmall)
+                    OptionRow(
+                        title = "Standard OpenBeken",
+                        subtitle = "Full 20260625 build. Supports OTA header patching and WiFi injection.",
+                        selected = apViewModel.firmwareImage.value == FirmwareImage.STANDARD,
+                        onClick = { apViewModel.firmwareImage.value = FirmwareImage.STANDARD }
+                    )
+                    OptionRow(
+                        title = "Small OpenBeken (1MB-safe)",
+                        subtitle = "Smaller 20260625 build for CozyLife devices with limited flash.",
+                        selected = apViewModel.firmwareImage.value == FirmwareImage.SMALL,
+                        onClick = { apViewModel.firmwareImage.value = FirmwareImage.SMALL }
+                    )
+                } else {
+                    Text("Firmware image", style = MaterialTheme.typography.titleSmall)
+                    Surface(
+                        shape = MaterialTheme.shapes.small,
+                        color = MaterialTheme.colorScheme.surfaceVariant,
+                        modifier = Modifier.fillMaxWidth()
+                    ) {
+                        Text(
+                            "OpenLN8825 1.18.295 OTA image. The app normalizes the LN image header before serving it.",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            modifier = Modifier.padding(12.dp)
+                        )
+                    }
+                }
 
                 Divider()
 
-                Row(
-                    modifier = Modifier.fillMaxWidth(),
-                    horizontalArrangement = Arrangement.SpaceBetween,
-                    verticalAlignment = Alignment.CenterVertically
-                ) {
-                    Column(modifier = Modifier.weight(1f)) {
-                        Text("Preconfigure WiFi", style = MaterialTheme.typography.titleSmall)
-                        Text(
-                            if (preconfigureWifi) "OpenBeken will try to join the target network after flashing."
-                            else "Leave off to use the normal OpenBeken AP pairing mode.",
-                            style = MaterialTheme.typography.bodySmall,
-                            color = MaterialTheme.colorScheme.onSurfaceVariant
+                if (targetMcu == TargetMcu.BL602) {
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Column(modifier = Modifier.weight(1f)) {
+                            Text("Preconfigure WiFi", style = MaterialTheme.typography.titleSmall)
+                            Text(
+                                if (preconfigureWifi) "OpenBeken will try to join the target network after flashing."
+                                else "Leave off to use the normal OpenBeken AP pairing mode.",
+                                style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant
+                            )
+                        }
+                        Switch(
+                            checked = preconfigureWifi,
+                            onCheckedChange = {
+                                apViewModel.preconfigureWifi.value = it
+                                apViewModel.saveWifiConfig()
+                            }
                         )
                     }
-                    Switch(
-                        checked = preconfigureWifi,
-                        onCheckedChange = {
-                            apViewModel.preconfigureWifi.value = it
-                            apViewModel.saveWifiConfig()
-                        }
-                    )
-                }
 
-                if (preconfigureWifi) {
-                    OutlinedTextField(
-                        value = apViewModel.wifiSsid.value,
-                        onValueChange = { apViewModel.wifiSsid.value = it; apViewModel.saveWifiConfig() },
-                        label = { Text("Target SSID") },
-                        singleLine = true,
-                        textStyle = TextStyle(color = MaterialTheme.colorScheme.onSurface),
-                        modifier = Modifier.fillMaxWidth()
-                    )
-                    OutlinedTextField(
-                        value = apViewModel.wifiPassword.value,
-                        onValueChange = { apViewModel.wifiPassword.value = it; apViewModel.saveWifiConfig() },
-                        label = { Text("Target password") },
-                        singleLine = true,
-                        visualTransformation = PasswordVisualTransformation(),
-                        textStyle = TextStyle(color = MaterialTheme.colorScheme.onSurface),
-                        modifier = Modifier.fillMaxWidth()
-                    )
-                    OutlinedTextField(
-                        value = apViewModel.wifiHostname.value,
-                        onValueChange = { apViewModel.wifiHostname.value = it; apViewModel.saveWifiConfig() },
-                        label = { Text("OpenBeken hostname") },
-                        singleLine = true,
-                        textStyle = TextStyle(color = MaterialTheme.colorScheme.onSurface),
-                        modifier = Modifier.fillMaxWidth()
-                    )
+                    if (preconfigureWifi) {
+                        OutlinedTextField(
+                            value = apViewModel.wifiSsid.value,
+                            onValueChange = { apViewModel.wifiSsid.value = it; apViewModel.saveWifiConfig() },
+                            label = { Text("Target SSID") },
+                            singleLine = true,
+                            textStyle = TextStyle(color = MaterialTheme.colorScheme.onSurface),
+                            modifier = Modifier.fillMaxWidth()
+                        )
+                        OutlinedTextField(
+                            value = apViewModel.wifiPassword.value,
+                            onValueChange = { apViewModel.wifiPassword.value = it; apViewModel.saveWifiConfig() },
+                            label = { Text("Target password") },
+                            singleLine = true,
+                            visualTransformation = PasswordVisualTransformation(),
+                            textStyle = TextStyle(color = MaterialTheme.colorScheme.onSurface),
+                            modifier = Modifier.fillMaxWidth()
+                        )
+                        OutlinedTextField(
+                            value = apViewModel.wifiHostname.value,
+                            onValueChange = { apViewModel.wifiHostname.value = it; apViewModel.saveWifiConfig() },
+                            label = { Text("OpenBeken hostname") },
+                            singleLine = true,
+                            textStyle = TextStyle(color = MaterialTheme.colorScheme.onSurface),
+                            modifier = Modifier.fillMaxWidth()
+                        )
+                    }
                 }
 
                 Surface(
@@ -894,15 +962,18 @@ fun MainTabContent(
                     modifier = Modifier.fillMaxWidth()
                 ) {
                     Column(modifier = Modifier.padding(12.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                        SummaryLine("Target", if (targetMcu == TargetMcu.LN882H) "LN882H / LN8825" else "BL602")
                         SummaryLine("Method", if (flashMethod == OtaTrigger.TCP_OTA) "CozyLife TCP/5555" else "AT UDP")
                         SummaryLine(
                             "Image",
-                            if (apViewModel.firmwareImage.value == FirmwareImage.SMALL) "Small OpenBeken"
+                            if (targetMcu == TargetMcu.LN882H) "OpenLN8825"
+                            else if (apViewModel.firmwareImage.value == FirmwareImage.SMALL) "Small OpenBeken"
                             else "Standard OpenBeken"
                         )
                         SummaryLine(
                             "WiFi",
-                            if (preconfigureWifi && targetSsid.isNotBlank()) "preconfigure $targetSsid"
+                            if (targetMcu == TargetMcu.LN882H) "unchanged by flasher"
+                            else if (preconfigureWifi && targetSsid.isNotBlank()) "preconfigure $targetSsid"
                             else "OpenBeken AP pairing"
                         )
                     }
@@ -910,10 +981,10 @@ fun MainTabContent(
 
                 Button(
                     onClick = { if (!isFlashing) onFlashClick(flashMethod) },
-                    enabled = !isFlashing && (!preconfigureWifi || targetSsid.isNotBlank()),
+                    enabled = !isFlashing && (targetMcu == TargetMcu.LN882H || !preconfigureWifi || targetSsid.isNotBlank()),
                     modifier = Modifier.fillMaxWidth()
                 ) {
-                    Text("Flash OpenBeken")
+                    Text(if (targetMcu == TargetMcu.LN882H) "Flash LN882H OpenBeken" else "Flash OpenBeken")
                 }
 
                 when (phase) {

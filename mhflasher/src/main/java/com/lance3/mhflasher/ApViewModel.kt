@@ -16,6 +16,7 @@ import androidx.lifecycle.AndroidViewModel
 
 enum class FlashPhase { IDLE, PATCHING, COMPRESSING, READY, UPLOADING, DONE, ERROR }
 enum class FirmwareImage { STANDARD, SMALL }
+enum class TargetMcu { BL602, LN882H }
 
 class ApViewModel(application: Application) : AndroidViewModel(application) {
     private val prefs = application.getSharedPreferences("mhflasher", Context.MODE_PRIVATE)
@@ -30,6 +31,7 @@ class ApViewModel(application: Application) : AndroidViewModel(application) {
     var remoteIP = mutableStateOf("")
     var flashProgress = mutableStateOf(0.0f)
     var flashPhase = mutableStateOf(FlashPhase.IDLE)
+    var targetMcu = mutableStateOf(TargetMcu.BL602)
     var firmwareImage = mutableStateOf(FirmwareImage.SMALL)
     var otaBytes: ByteArray? = null
     var useNewOtaFormat = mutableStateOf(false)
