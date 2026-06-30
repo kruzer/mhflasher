@@ -90,11 +90,13 @@ import java.io.IOException
 import java.io.InputStreamReader
 import java.net.DatagramPacket
 import java.net.DatagramSocket
+import java.net.HttpURLConnection
 import java.net.Inet4Address
 import java.net.InetAddress
 import java.net.ServerSocket
 import java.net.Socket
 import java.net.SocketTimeoutException
+import java.net.URLEncoder
 import java.net.URL
 
 object Constants {
@@ -116,7 +118,8 @@ enum class CMD(val str: String){
 
 enum class OtaTrigger {
     AT_UPURL,
-    TCP_OTA
+    TCP_OTA,
+    OPENBEKEN_HTTP
 }
 
 class MainActivity : ComponentActivity() {
@@ -533,6 +536,44 @@ class MainActivity : ComponentActivity() {
         }.start()
     }
 
+    private fun flashDeviceOpenBekenHttp() {
+        val ip = apViewModel.remoteIP.value
+        if (convertToInetAddress(ip) == null) {
+            logViewModel.addLog("Invalid IP address: $ip")
+            return
+        }
+
+        Thread {
+            try {
+                val localIp = apViewModel.localIP.value.ifBlank { "10.10.123.4" }
+                val otaUrl = "http://$localIp:${Constants.OTA_PORT}/update?version=vendor"
+                val encodedUrl = URLEncoder.encode(otaUrl, "UTF-8")
+                val triggerUrl = "http://$ip/ota_exec?host=$encodedUrl"
+                logViewModel.addLog("OpenBeken OTA: requesting $triggerUrl")
+
+                val connection = (URL(triggerUrl).openConnection() as HttpURLConnection).apply {
+                    requestMethod = "GET"
+                    connectTimeout = 5000
+                    readTimeout = 15000
+                }
+                val code = connection.responseCode
+                val response = try {
+                    val stream = if (code in 200..399) connection.inputStream else connection.errorStream
+                    stream?.bufferedReader()?.use { it.readText().take(240) }.orEmpty()
+                } finally {
+                    connection.disconnect()
+                }
+                logViewModel.addLog("OpenBeken OTA: HTTP $code")
+                if (response.isNotBlank()) {
+                    logViewModel.addLog("OpenBeken OTA: ${response.replace(Regex("\\s+"), " ")}")
+                }
+            } catch (e: Exception) {
+                logViewModel.addLog("OpenBeken OTA error: ${e.javaClass.simpleName}: ${e.message}")
+                mainThread { apViewModel.flashPhase.value = FlashPhase.ERROR }
+            }
+        }.start()
+    }
+
     private fun sendUdpPacket(ip: InetAddress, port: Int, cmd: CMD) {
         sendUdpPacket(
             ip = ip,
@@ -714,6 +755,7 @@ class MainActivity : ComponentActivity() {
                             when (trigger) {
                                 OtaTrigger.AT_UPURL -> flashDevice()
                                 OtaTrigger.TCP_OTA -> flashDeviceTcpOta()
+                                OtaTrigger.OPENBEKEN_HTTP -> flashDeviceOpenBekenHttp()
                             }
                             return@Thread
                         }
@@ -740,7 +782,7 @@ class MainActivity : ComponentActivity() {
                         apViewModel.otaBytes = built
                         logViewModel.addLog("BL602 firmware ready: ${built.size} bytes")
                         val otaPayloadLen = readLe32(built, 0x14)
-                        if (trigger != OtaTrigger.AT_UPURL && otaPayloadLen > Constants.TCP_OTA_FW_LIMIT) {
+                        if (trigger == OtaTrigger.TCP_OTA && otaPayloadLen > Constants.TCP_OTA_FW_LIMIT) {
                             logViewModel.addLog(
                                 "TCP OTA image too large: payload $otaPayloadLen > FW ${Constants.TCP_OTA_FW_LIMIT} bytes"
                             )
@@ -761,6 +803,7 @@ class MainActivity : ComponentActivity() {
                         when (trigger) {
                             OtaTrigger.AT_UPURL -> flashDevice()
                             OtaTrigger.TCP_OTA -> flashDeviceTcpOta()
+                            OtaTrigger.OPENBEKEN_HTTP -> flashDeviceOpenBekenHttp()
                         }
                     }
 
@@ -1008,6 +1051,13 @@ fun MainTabContent(
                     selected = flashMethod == OtaTrigger.TCP_OTA,
                     onClick = { flashMethod = OtaTrigger.TCP_OTA }
                 )
+                OptionRow(
+                    title = "OpenBeken HTTP",
+                    subtitle = "For devices already running OpenBeken. Calls /ota_exec with the phone OTA URL.",
+                    selected = flashMethod == OtaTrigger.OPENBEKEN_HTTP,
+                    enabled = targetMcu == TargetMcu.BL602,
+                    onClick = { flashMethod = OtaTrigger.OPENBEKEN_HTTP }
+                )
 
                 Divider()
 
@@ -1138,7 +1188,14 @@ fun MainTabContent(
                 ) {
                     Column(modifier = Modifier.padding(12.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {
                         SummaryLine("Target", if (targetMcu == TargetMcu.LN882H) "LN882H" else "BL602")
-                        SummaryLine("Method", if (flashMethod == OtaTrigger.TCP_OTA) "CozyLife TCP/5555" else "AT UDP")
+                        SummaryLine(
+                            "Method",
+                            when (flashMethod) {
+                                OtaTrigger.TCP_OTA -> "CozyLife TCP/5555"
+                                OtaTrigger.OPENBEKEN_HTTP -> "OpenBeken HTTP"
+                                OtaTrigger.AT_UPURL -> "AT UDP"
+                            }
+                        )
                         SummaryLine(
                             "Image",
                             if (targetMcu == TargetMcu.LN882H) "OpenLN882H"
