@@ -16,6 +16,7 @@ import androidx.lifecycle.AndroidViewModel
 
 enum class FlashPhase { IDLE, PATCHING, COMPRESSING, READY, UPLOADING, DONE, ERROR }
 enum class FirmwareImage { STANDARD, SMALL }
+enum class FirmwareSource { OPENBEKEN, VENDOR_RESTORE }
 enum class TargetMcu { BL602, LN882H }
 
 class ApViewModel(application: Application) : AndroidViewModel(application) {
@@ -32,7 +33,10 @@ class ApViewModel(application: Application) : AndroidViewModel(application) {
     var flashProgress = mutableStateOf(0.0f)
     var flashPhase = mutableStateOf(FlashPhase.IDLE)
     var targetMcu = mutableStateOf(TargetMcu.BL602)
+    var firmwareSource = mutableStateOf(FirmwareSource.OPENBEKEN)
     var firmwareImage = mutableStateOf(FirmwareImage.SMALL)
+    val vendorOtaFiles = mutableStateListOf<VendorOtaFile>()
+    var selectedVendorOtaPath = mutableStateOf("")
     var otaBytes: ByteArray? = null
     var useNewOtaFormat = mutableStateOf(false)
     var preconfigureWifi = mutableStateOf(prefs.getBoolean("preconfigureWifi", false))
@@ -58,3 +62,4 @@ class ApViewModel(application: Application) : AndroidViewModel(application) {
 }
 
 data class WifiAP(val name: String, val rssi: Int)
+data class VendorOtaFile(val name: String, val path: String, val size: Long)

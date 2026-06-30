@@ -2,8 +2,10 @@ package com.lance3.mhflasher
 
 import ApViewModel
 import FirmwareImage
+import FirmwareSource
 import LogViewModel
 import TargetMcu
+import VendorOtaFile
 import WifiAP
 import android.Manifest
 import android.content.BroadcastReceiver
@@ -83,6 +85,7 @@ import androidx.core.content.ContextCompat
 import com.lance3.mhflasher.ui.theme.MagicHomeFlasherTheme
 import java.io.BufferedOutputStream
 import java.io.BufferedReader
+import java.io.File
 import java.io.IOException
 import java.io.InputStreamReader
 import java.net.DatagramPacket
@@ -92,6 +95,7 @@ import java.net.InetAddress
 import java.net.ServerSocket
 import java.net.Socket
 import java.net.SocketTimeoutException
+import java.net.URL
 
 object Constants {
     const val OTA_PORT = 1111
@@ -127,10 +131,81 @@ class MainActivity : ComponentActivity() {
         Log.d("LOG","On create")
         setContent {
             MagicHomeFlasherTheme {
-                MyApp(logViewModel, apViewModel, {wifiCheckAndScan()}, {ap -> wifiConnect(ap)},{ip -> checkDeviceByIP(ip)}, {trigger -> prepareOtaAndFlash(applicationContext, trigger)}, {wifiReadConfig()}, {wifiSetAndReboot()})
+                MyApp(
+                    logViewModel,
+                    apViewModel,
+                    { wifiCheckAndScan() },
+                    { ap -> wifiConnect(ap) },
+                    { ip -> checkDeviceByIP(ip) },
+                    { trigger -> prepareOtaAndFlash(applicationContext, trigger) },
+                    { wifiReadConfig() },
+                    { wifiSetAndReboot() },
+                    { refreshVendorOtaFiles() },
+                    { url -> downloadVendorOta(url) }
+                )
             }
         }
         startHttpServer(applicationContext)
+        refreshVendorOtaFiles()
+    }
+
+    private fun vendorOtaDir(): File =
+        File(getExternalFilesDir(null), "vendor_ota").apply { mkdirs() }
+
+    private fun refreshVendorOtaFiles() {
+        val files = vendorOtaDir()
+            .listFiles { file -> file.isFile && file.name.endsWith(".ota", ignoreCase = true) }
+            ?.sortedBy { it.name.lowercase() }
+            .orEmpty()
+            .map { VendorOtaFile(it.name, it.absolutePath, it.length()) }
+
+        mainThread {
+            apViewModel.vendorOtaFiles.clear()
+            apViewModel.vendorOtaFiles.addAll(files)
+            if (apViewModel.selectedVendorOtaPath.value.isBlank() && files.isNotEmpty()) {
+                apViewModel.selectedVendorOtaPath.value = files.first().path
+            }
+            if (apViewModel.selectedVendorOtaPath.value.isNotBlank() && files.none { it.path == apViewModel.selectedVendorOtaPath.value }) {
+                apViewModel.selectedVendorOtaPath.value = files.firstOrNull()?.path.orEmpty()
+            }
+        }
+    }
+
+    private fun downloadVendorOta(url: String) {
+        if (url.isBlank()) {
+            logViewModel.addLog("Vendor OTA: URL is empty")
+            return
+        }
+
+        Thread {
+            try {
+                val parsed = URL(url)
+                val rawName = parsed.path.substringAfterLast('/').ifBlank { "vendor_${System.currentTimeMillis()}.xz.ota" }
+                val fileName = rawName.replace(Regex("[^A-Za-z0-9._-]"), "_")
+                val outFile = File(vendorOtaDir(), fileName)
+
+                logViewModel.addLog("Vendor OTA: downloading $url")
+                parsed.openConnection().apply {
+                    connectTimeout = 15000
+                    readTimeout = 60000
+                }.getInputStream().use { input ->
+                    outFile.outputStream().use { output ->
+                        val buffer = ByteArray(32 * 1024)
+                        var total = 0L
+                        while (true) {
+                            val read = input.read(buffer)
+                            if (read < 0) break
+                            output.write(buffer, 0, read)
+                            total += read
+                        }
+                        logViewModel.addLog("Vendor OTA: saved ${outFile.name} ($total bytes)")
+                    }
+                }
+                refreshVendorOtaFiles()
+            } catch (e: Exception) {
+                logViewModel.addLog("Vendor OTA download failed: ${e.javaClass.simpleName}: ${e.message}")
+            }
+        }.start()
     }
 
     private fun scanSuccess(results: List<ScanResult>?, wifiscanReceiver: BroadcastReceiver) {
@@ -613,6 +688,36 @@ class MainActivity : ComponentActivity() {
             try {
                 when (apViewModel.targetMcu.value) {
                     TargetMcu.BL602 -> {
+                        if (apViewModel.firmwareSource.value == FirmwareSource.VENDOR_RESTORE) {
+                            val selectedPath = apViewModel.selectedVendorOtaPath.value
+                            if (selectedPath.isBlank()) {
+                                logViewModel.addLog("Vendor OTA: no local file selected")
+                                mainThread { apViewModel.flashPhase.value = FlashPhase.ERROR }
+                                return@Thread
+                            }
+
+                            val vendorFile = File(selectedPath)
+                            if (!vendorFile.isFile) {
+                                logViewModel.addLog("Vendor OTA: selected file is missing: $selectedPath")
+                                refreshVendorOtaFiles()
+                                mainThread { apViewModel.flashPhase.value = FlashPhase.ERROR }
+                                return@Thread
+                            }
+
+                            val bytes = vendorFile.readBytes()
+                            if (!bytes.copyOfRange(0, minOf(bytes.size, 16)).contentEquals("BL60X_OTA_Ver1.0".toByteArray())) {
+                                logViewModel.addLog("Vendor OTA: warning, BL60X OTA magic not found")
+                            }
+                            apViewModel.otaBytes = bytes
+                            logViewModel.addLog("Vendor OTA ready: ${vendorFile.name}, ${bytes.size} bytes")
+                            mainThread { apViewModel.flashPhase.value = FlashPhase.READY }
+                            when (trigger) {
+                                OtaTrigger.AT_UPURL -> flashDevice()
+                                OtaTrigger.TCP_OTA -> flashDeviceTcpOta()
+                            }
+                            return@Thread
+                        }
+
                         val image = apViewModel.firmwareImage.value
                         val rawPayloadAsset = when (image) {
                             FirmwareImage.STANDARD -> "OpenBL602_dev_20260625_142543_OTA.bin"
@@ -706,10 +811,12 @@ fun MyApp(
     onFlashClick: (OtaTrigger) -> Unit,
     onWifiReadClick: () -> Unit,
     onWifiSetClick: () -> Unit,
+    onRefreshVendorFiles: () -> Unit,
+    onDownloadVendorUrl: (String) -> Unit,
     selTab: Int = 0
 ) {
     var tabIndex by remember { mutableIntStateOf(selTab) }
-    val tabTitles = listOf("flash", "log", "about")
+    val tabTitles = listOf("flash", "files", "log", "about")
     Column(modifier = Modifier.fillMaxSize()) {
         TabRow(selectedTabIndex = tabIndex) {
             tabTitles.forEachIndexed { index, title ->
@@ -721,7 +828,8 @@ fun MyApp(
         }
         when (tabIndex) {
             0 -> MainTabContent(logViewModel,apViewModel,onScanClick,onConnectClick, onCheckDeviceClick, onFlashClick, onWifiReadClick, onWifiSetClick)
-            1 -> LogTabContent(logViewModel)
+            1 -> FilesTabContent(apViewModel, onRefreshVendorFiles, onDownloadVendorUrl)
+            2 -> LogTabContent(logViewModel)
         }
     }
 }
@@ -769,6 +877,7 @@ fun MainTabContent(
     val connectedAp = apViewModel.connectedAP.value
     val looksCozyLife = isCozyLifeAp(connectedAp)
     val targetMcu = apViewModel.targetMcu.value
+    val firmwareSource = apViewModel.firmwareSource.value
     var flashMethod by remember(connectedAp) {
         mutableStateOf(if (looksCozyLife) OtaTrigger.TCP_OTA else OtaTrigger.AT_UPURL)
     }
@@ -792,6 +901,7 @@ fun MainTabContent(
     LaunchedEffect(targetMcu) {
         if (targetMcu == TargetMcu.LN882H) {
             flashMethod = OtaTrigger.TCP_OTA
+            apViewModel.firmwareSource.value = FirmwareSource.OPENBEKEN
         }
     }
 
@@ -902,19 +1012,54 @@ fun MainTabContent(
                 Divider()
 
                 if (targetMcu == TargetMcu.BL602) {
+                    Text("Firmware source", style = MaterialTheme.typography.titleSmall)
+                    OptionRow(
+                        title = "OpenBeken",
+                        subtitle = "Build bundled with the app. Can patch OTA header and optionally inject WiFi config.",
+                        selected = firmwareSource == FirmwareSource.OPENBEKEN,
+                        onClick = { apViewModel.firmwareSource.value = FirmwareSource.OPENBEKEN }
+                    )
+                    OptionRow(
+                        title = "Vendor restore OTA",
+                        subtitle = "Serve a locally cached BL602 .ota file, without patching or WiFi injection.",
+                        selected = firmwareSource == FirmwareSource.VENDOR_RESTORE,
+                        onClick = { apViewModel.firmwareSource.value = FirmwareSource.VENDOR_RESTORE }
+                    )
+
+                    Divider()
+
                     Text("Firmware image", style = MaterialTheme.typography.titleSmall)
-                    OptionRow(
-                        title = "Standard OpenBeken",
-                        subtitle = "Full 20260625 build. Supports OTA header patching and WiFi injection.",
-                        selected = apViewModel.firmwareImage.value == FirmwareImage.STANDARD,
-                        onClick = { apViewModel.firmwareImage.value = FirmwareImage.STANDARD }
-                    )
-                    OptionRow(
-                        title = "Small OpenBeken (1MB-safe)",
-                        subtitle = "Smaller 20260625 build for CozyLife devices with limited flash.",
-                        selected = apViewModel.firmwareImage.value == FirmwareImage.SMALL,
-                        onClick = { apViewModel.firmwareImage.value = FirmwareImage.SMALL }
-                    )
+                    if (firmwareSource == FirmwareSource.OPENBEKEN) {
+                        OptionRow(
+                            title = "Standard OpenBeken",
+                            subtitle = "Full 20260625 build. Supports OTA header patching and WiFi injection.",
+                            selected = apViewModel.firmwareImage.value == FirmwareImage.STANDARD,
+                            onClick = { apViewModel.firmwareImage.value = FirmwareImage.STANDARD }
+                        )
+                        OptionRow(
+                            title = "Small OpenBeken (1MB-safe)",
+                            subtitle = "Smaller 20260625 build for CozyLife devices with limited flash.",
+                            selected = apViewModel.firmwareImage.value == FirmwareImage.SMALL,
+                            onClick = { apViewModel.firmwareImage.value = FirmwareImage.SMALL }
+                        )
+                    } else {
+                        if (apViewModel.vendorOtaFiles.isEmpty()) {
+                            Text(
+                                "No local vendor OTA files. Use the files tab to download a .ota file before connecting to the device AP.",
+                                style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant
+                            )
+                        } else {
+                            apViewModel.vendorOtaFiles.forEach { file ->
+                                OptionRow(
+                                    title = file.name,
+                                    subtitle = "${file.size} bytes",
+                                    selected = apViewModel.selectedVendorOtaPath.value == file.path,
+                                    onClick = { apViewModel.selectedVendorOtaPath.value = file.path }
+                                )
+                            }
+                        }
+                    }
                 } else {
                     Text("Firmware image", style = MaterialTheme.typography.titleSmall)
                     Surface(
@@ -933,7 +1078,7 @@ fun MainTabContent(
 
                 Divider()
 
-                if (targetMcu == TargetMcu.BL602) {
+                if (targetMcu == TargetMcu.BL602 && firmwareSource == FirmwareSource.OPENBEKEN) {
                     Row(
                         modifier = Modifier.fillMaxWidth(),
                         horizontalArrangement = Arrangement.SpaceBetween,
@@ -997,24 +1142,34 @@ fun MainTabContent(
                         SummaryLine(
                             "Image",
                             if (targetMcu == TargetMcu.LN882H) "OpenLN882H"
+                            else if (firmwareSource == FirmwareSource.VENDOR_RESTORE) {
+                                apViewModel.vendorOtaFiles.firstOrNull { it.path == apViewModel.selectedVendorOtaPath.value }?.name ?: "No vendor OTA selected"
+                            }
                             else if (apViewModel.firmwareImage.value == FirmwareImage.SMALL) "Small OpenBeken"
                             else "Standard OpenBeken"
                         )
                         SummaryLine(
                             "WiFi",
                             if (targetMcu == TargetMcu.LN882H) "unchanged by flasher"
+                            else if (firmwareSource == FirmwareSource.VENDOR_RESTORE) "unchanged by flasher"
                             else if (preconfigureWifi && targetSsid.isNotBlank()) "preconfigure $targetSsid"
                             else "OpenBeken AP pairing"
                         )
                     }
                 }
 
+                val hasVendorSelection = firmwareSource != FirmwareSource.VENDOR_RESTORE ||
+                    apViewModel.selectedVendorOtaPath.value.isNotBlank()
                 Button(
                     onClick = { if (!isFlashing) onFlashClick(flashMethod) },
-                    enabled = !isFlashing && (targetMcu == TargetMcu.LN882H || !preconfigureWifi || targetSsid.isNotBlank()),
+                    enabled = !isFlashing && hasVendorSelection && (targetMcu == TargetMcu.LN882H || firmwareSource == FirmwareSource.VENDOR_RESTORE || !preconfigureWifi || targetSsid.isNotBlank()),
                     modifier = Modifier.fillMaxWidth()
                 ) {
-                    Text(if (targetMcu == TargetMcu.LN882H) "Flash LN882H OpenBeken" else "Flash OpenBeken")
+                    Text(
+                        if (targetMcu == TargetMcu.LN882H) "Flash LN882H OpenBeken"
+                        else if (firmwareSource == FirmwareSource.VENDOR_RESTORE) "Flash vendor OTA"
+                        else "Flash OpenBeken"
+                    )
                 }
 
                 when (phase) {
@@ -1214,6 +1369,76 @@ Button(onClick = { onCheckDeviceClick(apViewModel.remoteIP.value) }) {
     Text(text = "Check device")
 }
  */
+
+@Composable
+fun FilesTabContent(
+    apViewModel: ApViewModel,
+    onRefreshVendorFiles: () -> Unit,
+    onDownloadVendorUrl: (String) -> Unit
+) {
+    var url by remember { mutableStateOf("") }
+
+    Column(
+        modifier = Modifier
+            .fillMaxSize()
+            .verticalScroll(rememberScrollState())
+            .padding(horizontal = 14.dp, vertical = 10.dp),
+        verticalArrangement = Arrangement.spacedBy(14.dp)
+    ) {
+        SectionCard("Vendor OTA cache") {
+            Text(
+                "Download vendor .ota files before connecting to the device AP. The flash tab can then serve the selected local file without internet access.",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant
+            )
+            OutlinedTextField(
+                value = url,
+                onValueChange = { url = it },
+                label = { Text("OTA file URL") },
+                singleLine = false,
+                textStyle = TextStyle(color = MaterialTheme.colorScheme.onSurface),
+                modifier = Modifier.fillMaxWidth()
+            )
+            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                Button(
+                    onClick = { onDownloadVendorUrl(url) },
+                    modifier = Modifier.weight(1f)
+                ) {
+                    Text("Download")
+                }
+                FilledTonalButton(
+                    onClick = { onRefreshVendorFiles() },
+                    modifier = Modifier.weight(1f)
+                ) {
+                    Text("Refresh")
+                }
+            }
+        }
+
+        SectionCard("Local vendor OTA files") {
+            if (apViewModel.vendorOtaFiles.isEmpty()) {
+                Text(
+                    "No local .ota files found yet.",
+                    style = MaterialTheme.typography.bodyMedium,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
+            } else {
+                apViewModel.vendorOtaFiles.forEach { file ->
+                    OptionRow(
+                        title = file.name,
+                        subtitle = "${file.size} bytes",
+                        selected = apViewModel.selectedVendorOtaPath.value == file.path,
+                        onClick = {
+                            apViewModel.selectedVendorOtaPath.value = file.path
+                            apViewModel.firmwareSource.value = FirmwareSource.VENDOR_RESTORE
+                            apViewModel.targetMcu.value = TargetMcu.BL602
+                        }
+                    )
+                }
+            }
+        }
+    }
+}
 
 @Composable
 fun LogTabContent(logViewModel: LogViewModel) {
