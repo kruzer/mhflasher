@@ -118,6 +118,7 @@ enum class OtaTrigger {
 class MainActivity : ComponentActivity() {
     private val logViewModel = LogViewModel()
     private val apViewModel: ApViewModel by viewModels()
+    private var httpRequestCount = 0
     companion object {
         const val MY_PERMISSIONS_REQUEST_LOCATION = 1
     }
@@ -539,6 +540,9 @@ class MainActivity : ComponentActivity() {
 
                 while (!Thread.currentThread().isInterrupted) {
                     val socket = serverSocket.accept()
+                    val requestNo = ++httpRequestCount
+                    var totalSentBytes = 0
+                    var fileSize = 0
                     try {
                         val input = BufferedReader(InputStreamReader(socket.getInputStream()))
                         val output = BufferedOutputStream(socket.getOutputStream())
@@ -548,12 +552,13 @@ class MainActivity : ComponentActivity() {
                         while (input.readLine().also { line = it } != null && line != "") {
                             requestLines.add(line!!)
                         }
-                        logViewModel.addLog("Received HTTP Request:")
-                        requestLines.forEach { logViewModel.addLog(it) }
+                        val requestLine = requestLines.firstOrNull().orEmpty()
+                        logViewModel.addLog("HTTP GET #$requestNo from ${socket.inetAddress.hostAddress}:${socket.port}: $requestLine")
+                        requestLines.drop(1).forEach { logViewModel.addLog("HTTP #$requestNo header: $it") }
 
                         val bytes = apViewModel.otaBytes
                         if (bytes == null) {
-                            logViewModel.addLog("OTA not ready — rejecting request")
+                            logViewModel.addLog("HTTP #$requestNo: OTA not ready, closing connection")
                             socket.close()
                             continue
                         }
@@ -561,11 +566,11 @@ class MainActivity : ComponentActivity() {
                         mainThread { apViewModel.flashProgress.value = 0f }
                         mainThread { apViewModel.flashPhase.value = FlashPhase.UPLOADING }
 
-                        val fileSize = bytes.size
+                        fileSize = bytes.size
+                        logViewModel.addLog("HTTP #$requestNo: Content-Length=$fileSize")
                         output.write("HTTP/1.1 200 OK\r\nContent-Length: $fileSize\r\n\r\n".toByteArray())
 
                         val chunkSize = 1024 * 10
-                        var totalSentBytes = 0
                         var offset = 0
                         while (offset < bytes.size) {
                             val end = minOf(offset + chunkSize, bytes.size)
@@ -573,14 +578,18 @@ class MainActivity : ComponentActivity() {
                             totalSentBytes += end - offset
                             offset = end
                             val progress = totalSentBytes.toFloat() / fileSize
-                            logViewModel.addLog("Sent $totalSentBytes of $fileSize bytes")
+                            logViewModel.addLog("HTTP #$requestNo: sent $totalSentBytes/$fileSize bytes")
                             mainThread { apViewModel.flashProgress.value = progress }
                         }
-                        logViewModel.addLog("Finished uploading $totalSentBytes bytes")
-                        mainThread { apViewModel.flashPhase.value = FlashPhase.DONE }
                         output.flush()
+                        logViewModel.addLog("HTTP #$requestNo: flush ok")
+                        logViewModel.addLog("HTTP #$requestNo: finished uploading $totalSentBytes/$fileSize bytes")
+                        mainThread { apViewModel.flashPhase.value = FlashPhase.DONE }
                         output.close()
                         input.close()
+                    } catch (e: IOException) {
+                        logViewModel.addLog("HTTP #$requestNo: connection error after $totalSentBytes/$fileSize bytes: ${e.javaClass.simpleName}: ${e.message}")
+                        mainThread { apViewModel.flashPhase.value = FlashPhase.ERROR }
                     } finally {
                         try { socket.close() } catch (_: Exception) {}
                     }
