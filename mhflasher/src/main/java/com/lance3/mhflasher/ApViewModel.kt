@@ -21,6 +21,13 @@ enum class TargetMcu { BL602, LN882H }
 
 class ApViewModel(application: Application) : AndroidViewModel(application) {
     private val prefs = application.getSharedPreferences("mhflasher", Context.MODE_PRIVATE)
+    private val initialVendorCatalogUrl = prefs.getString("vendorCatalogUrl", null).let { saved ->
+        if (saved.isNullOrBlank() || saved == LEGACY_VENDOR_CATALOG_URL) {
+            DEFAULT_VENDOR_CATALOG_URL
+        } else {
+            saved
+        }
+    }
 
     val accessPoints = mutableStateListOf<WifiAP>()
     var isConnected = mutableStateOf(false)
@@ -38,7 +45,7 @@ class ApViewModel(application: Application) : AndroidViewModel(application) {
     val vendorOtaFiles = mutableStateListOf<VendorOtaFile>()
     val vendorCatalogItems = mutableStateListOf<VendorCatalogItem>()
     var selectedVendorOtaPath = mutableStateOf("")
-    var vendorCatalogUrl = mutableStateOf(prefs.getString("vendorCatalogUrl", DEFAULT_VENDOR_CATALOG_URL) ?: DEFAULT_VENDOR_CATALOG_URL)
+    var vendorCatalogUrl = mutableStateOf(initialVendorCatalogUrl)
     var otaBytes: ByteArray? = null
     var useNewOtaFormat = mutableStateOf(false)
     var preconfigureWifi = mutableStateOf(prefs.getBoolean("preconfigureWifi", false))
@@ -59,6 +66,12 @@ class ApViewModel(application: Application) : AndroidViewModel(application) {
         prefs.edit()
             .putString("vendorCatalogUrl", vendorCatalogUrl.value)
             .apply()
+    }
+
+    fun resetFlashState() {
+        flashPhase.value = FlashPhase.IDLE
+        flashProgress.value = 0f
+        otaBytes = null
     }
 
     fun addAccessPoint(ap: WifiAP) {
@@ -83,5 +96,7 @@ data class VendorCatalogItem(
     val experimental: Boolean
 )
 
-const val DEFAULT_VENDOR_CATALOG_URL =
+const val LEGACY_VENDOR_CATALOG_URL =
     "https://github.com/kruzer/mhflasher/releases/download/vendor-bl602-magic-home-sample-20260701/manifest.json"
+const val DEFAULT_VENDOR_CATALOG_URL =
+    "$LEGACY_VENDOR_CATALOG_URL?v=20260701-full"

@@ -14,20 +14,24 @@ import android.content.Context
 import android.content.Intent
 import android.content.IntentFilter
 import android.content.pm.PackageManager
+import android.database.Cursor
 import android.net.ConnectivityManager
 import android.net.LinkProperties
 import android.net.Network
 import android.net.NetworkCapabilities
 import android.net.NetworkRequest
+import android.net.Uri
 import android.net.wifi.ScanResult
 import android.net.wifi.WifiManager
 import android.net.wifi.WifiNetworkSpecifier
 import android.os.Build
 import android.os.Bundle
+import android.provider.OpenableColumns
 import android.util.Log
 import android.widget.Toast
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.annotation.RequiresApi
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
@@ -97,7 +101,6 @@ import java.net.InetAddress
 import java.net.ServerSocket
 import java.net.Socket
 import java.net.SocketTimeoutException
-import java.net.URLEncoder
 import java.net.URL
 import java.security.MessageDigest
 import org.json.JSONObject
@@ -129,6 +132,13 @@ class MainActivity : ComponentActivity() {
     private val logViewModel = LogViewModel()
     private val apViewModel: ApViewModel by viewModels()
     private var httpRequestCount = 0
+    private val vendorOtaPicker = registerForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
+        if (uri != null) {
+            importVendorOtaFromUri(uri)
+        } else {
+            logViewModel.addLog("Vendor OTA import cancelled")
+        }
+    }
     companion object {
         const val MY_PERMISSIONS_REQUEST_LOCATION = 1
     }
@@ -144,10 +154,15 @@ class MainActivity : ComponentActivity() {
                     { ap -> wifiConnect(ap) },
                     { ip -> checkDeviceByIP(ip) },
                     { trigger -> prepareOtaAndFlash(applicationContext, trigger) },
+                    {
+                        apViewModel.resetFlashState()
+                        logViewModel.addLog("Flash stopped by user; ready to retry")
+                    },
                     { wifiReadConfig() },
                     { wifiSetAndReboot() },
                     { refreshVendorOtaFiles() },
                     { url -> downloadVendorOta(url) },
+                    { vendorOtaPicker.launch(arrayOf("*/*")) },
                     { url -> refreshVendorCatalog(url) },
                     { item -> downloadVendorCatalogItem(item) }
                 )
@@ -159,6 +174,63 @@ class MainActivity : ComponentActivity() {
 
     private fun vendorOtaDir(): File =
         File(getExternalFilesDir(null), "vendor_ota").apply { mkdirs() }
+
+    private fun displayNameForUri(uri: Uri): String {
+        var cursor: Cursor? = null
+        return try {
+            cursor = contentResolver.query(uri, arrayOf(OpenableColumns.DISPLAY_NAME), null, null, null)
+            if (cursor != null && cursor.moveToFirst()) {
+                val index = cursor.getColumnIndex(OpenableColumns.DISPLAY_NAME)
+                if (index >= 0) cursor.getString(index) else null
+            } else {
+                null
+            }
+        } catch (_: Exception) {
+            null
+        } finally {
+            cursor?.close()
+        } ?: uri.lastPathSegment?.substringAfterLast('/') ?: "vendor_${System.currentTimeMillis()}.xz.ota"
+    }
+
+    private fun importVendorOtaFromUri(uri: Uri) {
+        Thread {
+            try {
+                val rawName = displayNameForUri(uri)
+                val fileName = rawName.replace(Regex("[^A-Za-z0-9._-]"), "_")
+                val outFile = File(vendorOtaDir(), fileName)
+                var total = 0L
+
+                contentResolver.openInputStream(uri).use { input ->
+                    if (input == null) throw IOException("unable to open selected file")
+                    outFile.outputStream().use { output ->
+                        val buffer = ByteArray(32 * 1024)
+                        while (true) {
+                            val read = input.read(buffer)
+                            if (read < 0) break
+                            output.write(buffer, 0, read)
+                            total += read
+                        }
+                    }
+                }
+
+                if (total <= 0) throw IOException("selected file is empty")
+
+                val sha256 = sha256Hex(outFile)
+                mainThread {
+                    apViewModel.selectedVendorOtaPath.value = outFile.absolutePath
+                    apViewModel.firmwareSource.value = FirmwareSource.VENDOR_RESTORE
+                    apViewModel.targetMcu.value = TargetMcu.BL602
+                    apViewModel.otaBytes = null
+                }
+                refreshVendorOtaFiles()
+                logViewModel.addLog("Vendor OTA: imported ${outFile.name} ($total bytes)")
+                logViewModel.addLog("Vendor OTA: sha256 ${sha256.take(12)}...")
+                logViewModel.addLog("Vendor OTA: selected ${outFile.name}")
+            } catch (e: Exception) {
+                logViewModel.addLog("Vendor OTA import failed: ${e.javaClass.simpleName}: ${e.message}")
+            }
+        }.start()
+    }
 
     private fun refreshVendorOtaFiles() {
         val files = vendorOtaDir()
@@ -180,10 +252,15 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun downloadVendorOta(url: String) {
-        downloadVendorOta(url, expectedSha256 = null, expectedSize = null)
+        downloadVendorOta(url, preferredFileName = null, expectedSha256 = null, expectedSize = null)
     }
 
-    private fun downloadVendorOta(url: String, expectedSha256: String?, expectedSize: Long?) {
+    private fun downloadVendorOta(
+        url: String,
+        preferredFileName: String?,
+        expectedSha256: String?,
+        expectedSize: Long?
+    ) {
         if (url.isBlank()) {
             logViewModel.addLog("Vendor OTA: URL is empty")
             return
@@ -192,7 +269,9 @@ class MainActivity : ComponentActivity() {
         Thread {
             try {
                 val parsed = URL(url)
-                val rawName = parsed.path.substringAfterLast('/').ifBlank { "vendor_${System.currentTimeMillis()}.xz.ota" }
+                val rawName = preferredFileName
+                    ?.takeIf { it.isNotBlank() }
+                    ?: parsed.path.substringAfterLast('/').ifBlank { "vendor_${System.currentTimeMillis()}.xz.ota" }
                 val fileName = rawName.replace(Regex("[^A-Za-z0-9._-]"), "_")
                 val outFile = File(vendorOtaDir(), fileName)
 
@@ -218,11 +297,19 @@ class MainActivity : ComponentActivity() {
                             if (!sha256.equals(expectedSha256, ignoreCase = true)) {
                                 throw IOException("sha256 mismatch: got $sha256, expected $expectedSha256")
                             }
+                            logViewModel.addLog("Vendor OTA: sha256 ${sha256.take(12)}... ok")
                         }
                         logViewModel.addLog("Vendor OTA: saved ${outFile.name} ($total bytes)")
                     }
                 }
+                mainThread {
+                    apViewModel.selectedVendorOtaPath.value = outFile.absolutePath
+                    apViewModel.firmwareSource.value = FirmwareSource.VENDOR_RESTORE
+                    apViewModel.targetMcu.value = TargetMcu.BL602
+                    apViewModel.otaBytes = null
+                }
                 refreshVendorOtaFiles()
+                logViewModel.addLog("Vendor OTA: selected ${outFile.name}")
             } catch (e: Exception) {
                 logViewModel.addLog("Vendor OTA download failed: ${e.javaClass.simpleName}: ${e.message}")
             }
@@ -280,6 +367,7 @@ class MainActivity : ComponentActivity() {
         logViewModel.addLog("Vendor catalog: selected ${item.title}")
         downloadVendorOta(
             item.url,
+            preferredFileName = item.file,
             expectedSha256 = item.sha256.ifBlank { null },
             expectedSize = item.size.takeIf { it >= 0 }
         )
@@ -443,7 +531,9 @@ class MainActivity : ComponentActivity() {
                     logViewModel.addLog("Device gateway IP: $deviceIp${if (firstDnsServer != null) " (DNS=$firstDnsServer ignored)" else ""}")
                     apViewModel.remoteIP.value = deviceIp
                     val deviceAddress = convertToInetAddress(deviceIp)
-                    if (deviceAddress != null && apViewModel.targetMcu.value == TargetMcu.BL602 && !isCozyLifeAp(ap.name)) {
+                    if (isOpenBekenAp(ap.name)) {
+                        fetchOpenBekenInfo(deviceIp)
+                    } else if (deviceAddress != null && apViewModel.targetMcu.value == TargetMcu.BL602 && !isCozyLifeAp(ap.name)) {
                         sendUdpPacket(deviceAddress, Constants.CMD_PORT, CMD.INFO)
                     } else {
                         logViewModel.addLog("Skipping UDP AT discovery for TCP-only device path")
@@ -465,6 +555,11 @@ class MainActivity : ComponentActivity() {
                 super.onLost(network)
                 logViewModel.addLog("Lost connection to ${ap.name}")
                 apViewModel.isConnected.value = false
+                val phase = apViewModel.flashPhase.value
+                if (phase != FlashPhase.IDLE && phase != FlashPhase.DONE && phase != FlashPhase.ERROR) {
+                    logViewModel.addLog("Flash interrupted: WiFi network was lost")
+                    apViewModel.flashPhase.value = FlashPhase.ERROR
+                }
             }
         }
 
@@ -480,8 +575,48 @@ class MainActivity : ComponentActivity() {
                 Toast.LENGTH_LONG
             ).show()
         } else {
-            sendUdpPacket(ip,Constants.CMD_PORT,CMD.INFO)
+            if (isOpenBekenAp(apViewModel.connectedAP.value)) {
+                fetchOpenBekenInfo(ipString)
+            } else {
+                sendUdpPacket(ip, Constants.CMD_PORT, CMD.INFO)
+            }
         }
+    }
+
+    private fun fetchOpenBekenInfo(ip: String) {
+        Thread {
+            try {
+                val url = "http://$ip/api/info"
+                logViewModel.addLog("OpenBeken info: requesting $url")
+                val text = URL(url).openConnection().apply {
+                    connectTimeout = 5000
+                    readTimeout = 10000
+                }.getInputStream().bufferedReader().use { it.readText() }
+
+                val obj = JSONObject(text)
+                val build = obj.optString("build")
+                val chipset = obj.optString("chipset")
+                val mac = obj.optString("mac")
+                val shortName = obj.optString("shortName")
+                val reportedIp = obj.optString("ip")
+
+                mainThread {
+                    apViewModel.firmwareVersion.value = build.ifBlank { "OpenBeken" }
+                    apViewModel.macAddress.value = mac
+                    apViewModel.deviceId.value = listOf(shortName, chipset)
+                        .filter { it.isNotBlank() }
+                        .joinToString(" / ")
+                    if (reportedIp.isNotBlank()) {
+                        apViewModel.remoteIP.value = reportedIp
+                    }
+                }
+
+                logViewModel.addLog("OpenBeken info: build=${build.ifBlank { "-" }}")
+                logViewModel.addLog("OpenBeken info: chipset=${chipset.ifBlank { "-" }} shortName=${shortName.ifBlank { "-" }} mac=${mac.ifBlank { "-" }}")
+            } catch (e: Exception) {
+                logViewModel.addLog("OpenBeken info failed: ${e.javaClass.simpleName}: ${e.message}")
+            }
+        }.start()
     }
 
     fun convertToInetAddress(ipInput: String): InetAddress? {
@@ -632,28 +767,77 @@ class MainActivity : ComponentActivity() {
 
         Thread {
             try {
-                val localIp = apViewModel.localIP.value.ifBlank { "10.10.123.4" }
-                val otaUrl = "http://$localIp:${Constants.OTA_PORT}/update?version=vendor"
-                val encodedUrl = URLEncoder.encode(otaUrl, "UTF-8")
-                val triggerUrl = "http://$ip/ota_exec?host=$encodedUrl"
-                logViewModel.addLog("OpenBeken OTA: requesting $triggerUrl")
-
-                val connection = (URL(triggerUrl).openConnection() as HttpURLConnection).apply {
-                    requestMethod = "GET"
-                    connectTimeout = 5000
-                    readTimeout = 15000
+                val bytes = apViewModel.otaBytes
+                if (bytes == null) {
+                    logViewModel.addLog("OpenBeken OTA: firmware is not ready")
+                    mainThread { apViewModel.flashPhase.value = FlashPhase.ERROR }
+                    return@Thread
                 }
-                val code = connection.responseCode
-                val response = try {
-                    val stream = if (code in 200..399) connection.inputStream else connection.errorStream
+
+                val uploadUrl = "http://$ip/api/ota"
+                logViewModel.addLog("OpenBeken OTA: uploading ${bytes.size} bytes to $uploadUrl")
+                mainThread {
+                    apViewModel.flashProgress.value = 0f
+                    apViewModel.flashPhase.value = FlashPhase.UPLOADING
+                }
+
+                val uploadConnection = (URL(uploadUrl).openConnection() as HttpURLConnection).apply {
+                    requestMethod = "POST"
+                    connectTimeout = 5000
+                    readTimeout = 120000
+                    doOutput = true
+                    setRequestProperty("Content-Type", "application/octet-stream")
+                    setRequestProperty("Connection", "close")
+                    setFixedLengthStreamingMode(bytes.size)
+                }
+
+                var sent = 0
+                val chunkSize = 10 * 1024
+                uploadConnection.outputStream.use { output ->
+                    while (sent < bytes.size) {
+                        val len = minOf(chunkSize, bytes.size - sent)
+                        output.write(bytes, sent, len)
+                        sent += len
+                        val progress = sent.toFloat() / bytes.size
+                        logViewModel.addLog("OpenBeken OTA: sent $sent/${bytes.size} bytes")
+                        mainThread { apViewModel.flashProgress.value = progress }
+                    }
+                    output.flush()
+                }
+
+                val uploadCode = uploadConnection.responseCode
+                val uploadResponse = try {
+                    val stream = if (uploadCode in 200..399) uploadConnection.inputStream else uploadConnection.errorStream
                     stream?.bufferedReader()?.use { it.readText().take(240) }.orEmpty()
                 } finally {
-                    connection.disconnect()
+                    uploadConnection.disconnect()
                 }
-                logViewModel.addLog("OpenBeken OTA: HTTP $code")
-                if (response.isNotBlank()) {
-                    logViewModel.addLog("OpenBeken OTA: ${response.replace(Regex("\\s+"), " ")}")
+                logViewModel.addLog("OpenBeken OTA: HTTP $uploadCode")
+                if (uploadResponse.isNotBlank()) {
+                    logViewModel.addLog("OpenBeken OTA: ${uploadResponse.replace(Regex("\\s+"), " ")}")
                 }
+                if (uploadCode !in 200..399) {
+                    mainThread { apViewModel.flashPhase.value = FlashPhase.ERROR }
+                    return@Thread
+                }
+
+                logViewModel.addLog("OpenBeken OTA: upload accepted, restarting device")
+                val rebootConnection = (URL("http://$ip/api/reboot").openConnection() as HttpURLConnection).apply {
+                    requestMethod = "POST"
+                    connectTimeout = 5000
+                    readTimeout = 10000
+                    setRequestProperty("Connection", "close")
+                }
+                val rebootCode = rebootConnection.responseCode
+                val rebootResponse = try {
+                    val stream = if (rebootCode in 200..399) rebootConnection.inputStream else rebootConnection.errorStream
+                    stream?.bufferedReader()?.use { it.readText().take(120) }.orEmpty()
+                } finally {
+                    rebootConnection.disconnect()
+                }
+                logViewModel.addLog("OpenBeken OTA reboot: HTTP $rebootCode ${rebootResponse.replace(Regex("\\s+"), " ")}")
+                logViewModel.addLog("Flash sent. Wait 15-30 seconds; if the device does not appear, power-cycle it manually.")
+                mainThread { apViewModel.flashPhase.value = FlashPhase.DONE }
             } catch (e: Exception) {
                 logViewModel.addLog("OpenBeken OTA error: ${e.javaClass.simpleName}: ${e.message}")
                 mainThread { apViewModel.flashPhase.value = FlashPhase.ERROR }
@@ -811,7 +995,11 @@ class MainActivity : ComponentActivity() {
         context: Context,
         trigger: OtaTrigger
     ) {
-        mainThread { apViewModel.flashPhase.value = FlashPhase.PATCHING }
+        apViewModel.otaBytes = null
+        mainThread {
+            apViewModel.flashProgress.value = 0f
+            apViewModel.flashPhase.value = FlashPhase.PATCHING
+        }
         Thread {
             try {
                 when (apViewModel.targetMcu.value) {
@@ -859,11 +1047,13 @@ class MainActivity : ComponentActivity() {
                         mainThread { apViewModel.flashPhase.value = FlashPhase.COMPRESSING }
                         logViewModel.addLog("Compressing (XZ)... this may take a few seconds")
                         val injectWifi = apViewModel.preconfigureWifi.value
+                        logViewModel.addLog("WiFi preconfigure: ${if (injectWifi) "enabled" else "disabled"}")
                         val built = OtaPatcher.buildOtaFile(
                             rawPayload, headerTemplate,
-                            if (injectWifi) apViewModel.wifiSsid.value else "",
-                            if (injectWifi) apViewModel.wifiPassword.value else "",
-                            if (injectWifi) apViewModel.wifiHostname.value else "",
+                            injectWifi,
+                            apViewModel.wifiSsid.value,
+                            apViewModel.wifiPassword.value,
+                            apViewModel.wifiHostname.value,
                             log = { logViewModel.addLog(it) }
                         )
                         apViewModel.otaBytes = built
@@ -939,10 +1129,12 @@ fun MyApp(
     onConnectClick: (WifiAP) -> kotlin.Unit,
     onCheckDeviceClick: (String) -> Unit,
     onFlashClick: (OtaTrigger) -> Unit,
+    onStopFlashClick: () -> Unit,
     onWifiReadClick: () -> Unit,
     onWifiSetClick: () -> Unit,
     onRefreshVendorFiles: () -> Unit,
     onDownloadVendorUrl: (String) -> Unit,
+    onImportVendorFile: () -> Unit,
     onRefreshVendorCatalog: (String) -> Unit,
     onDownloadVendorCatalogItem: (VendorCatalogItem) -> Unit,
     selTab: Int = 0
@@ -959,8 +1151,8 @@ fun MyApp(
             }
         }
         when (tabIndex) {
-            0 -> MainTabContent(logViewModel,apViewModel,onScanClick,onConnectClick, onCheckDeviceClick, onFlashClick, onWifiReadClick, onWifiSetClick)
-            1 -> FilesTabContent(apViewModel, onRefreshVendorFiles, onDownloadVendorUrl, onRefreshVendorCatalog, onDownloadVendorCatalogItem)
+            0 -> MainTabContent(logViewModel,apViewModel,onScanClick,onConnectClick, onCheckDeviceClick, onFlashClick, onStopFlashClick, onWifiReadClick, onWifiSetClick)
+            1 -> FilesTabContent(apViewModel, onRefreshVendorFiles, onDownloadVendorUrl, onImportVendorFile, onRefreshVendorCatalog, onDownloadVendorCatalogItem)
             2 -> LogTabContent(logViewModel)
         }
     }
@@ -1003,15 +1195,23 @@ fun MainTabContent(
     onConnectClick: (WifiAP) -> Unit,
     onCheckDeviceClick: (String) -> Unit,
     onFlashClick: (OtaTrigger) -> Unit,
+    onStopFlashClick: () -> Unit,
     onWifiReadClick: () -> Unit,
     onWifiSetClick: () -> Unit
 ) {
     val connectedAp = apViewModel.connectedAP.value
     val looksCozyLife = isCozyLifeAp(connectedAp)
+    val looksOpenBeken = isOpenBekenAp(connectedAp)
     val targetMcu = apViewModel.targetMcu.value
     val firmwareSource = apViewModel.firmwareSource.value
     var flashMethod by remember(connectedAp) {
-        mutableStateOf(if (looksCozyLife) OtaTrigger.TCP_OTA else OtaTrigger.AT_UPURL)
+        mutableStateOf(
+            when {
+                looksOpenBeken -> OtaTrigger.OPENBEKEN_HTTP
+                looksCozyLife -> OtaTrigger.TCP_OTA
+                else -> OtaTrigger.AT_UPURL
+            }
+        )
     }
     val preconfigureWifi = apViewModel.preconfigureWifi.value
     val targetSsid = apViewModel.wifiSsid.value
@@ -1027,6 +1227,11 @@ fun MainTabContent(
         }
         if (connectedAp.isNotBlank()) {
             apViewModel.firmwareImage.value = if (looksCozyLife) FirmwareImage.SMALL else FirmwareImage.STANDARD
+        }
+        if (looksOpenBeken) {
+            apViewModel.targetMcu.value = TargetMcu.BL602
+            apViewModel.firmwareSource.value = FirmwareSource.VENDOR_RESTORE
+            flashMethod = OtaTrigger.OPENBEKEN_HTTP
         }
     }
 
@@ -1095,7 +1300,7 @@ fun MainTabContent(
                         onClick = { onCheckDeviceClick(apViewModel.remoteIP.value) },
                         modifier = Modifier.fillMaxWidth()
                     ) {
-                        Text("Retry AT discovery")
+                        Text(if (looksOpenBeken) "Retry OpenBeken info" else "Retry AT discovery")
                     }
                 } else if (targetMcu == TargetMcu.LN882H) {
                     Text(
@@ -1141,8 +1346,8 @@ fun MainTabContent(
                     onClick = { flashMethod = OtaTrigger.TCP_OTA }
                 )
                 OptionRow(
-                    title = "OpenBeken HTTP",
-                    subtitle = "For devices already running OpenBeken. Calls /ota_exec with the phone OTA URL.",
+                    title = "OpenBeken REST upload",
+                    subtitle = "For devices already running OpenBeken. Uploads the selected OTA to /api/ota and restarts.",
                     selected = flashMethod == OtaTrigger.OPENBEKEN_HTTP,
                     enabled = targetMcu == TargetMcu.BL602,
                     onClick = { flashMethod = OtaTrigger.OPENBEKEN_HTTP }
@@ -1281,7 +1486,7 @@ fun MainTabContent(
                             "Method",
                             when (flashMethod) {
                                 OtaTrigger.TCP_OTA -> "CozyLife TCP/5555"
-                                OtaTrigger.OPENBEKEN_HTTP -> "OpenBeken HTTP"
+                                OtaTrigger.OPENBEKEN_HTTP -> "OpenBeken REST"
                                 OtaTrigger.AT_UPURL -> "AT UDP"
                             }
                         )
@@ -1316,6 +1521,14 @@ fun MainTabContent(
                         else if (firmwareSource == FirmwareSource.VENDOR_RESTORE) "Flash vendor OTA"
                         else "Flash OpenBeken"
                     )
+                }
+                if (phase != FlashPhase.IDLE) {
+                    FilledTonalButton(
+                        onClick = onStopFlashClick,
+                        modifier = Modifier.fillMaxWidth()
+                    ) {
+                        Text("Stop / reset flash attempt")
+                    }
                 }
 
                 when (phase) {
@@ -1481,7 +1694,11 @@ fun SummaryLine(label: String, value: String) {
 fun isCozyLifeAp(apName: String): Boolean =
     apName.startsWith("CozyLife", ignoreCase = true)
 
+fun isOpenBekenAp(apName: String): Boolean =
+    apName.startsWith("OpenBL", ignoreCase = true)
+
 fun inferredDeviceSummary(apName: String, firmwareVersion: String): String = when {
+    isOpenBekenAp(apName) -> "OpenBeken AP detected. Vendor restore via OpenBeken REST is selected by default."
     isCozyLifeAp(apName) -> "CozyLife-like AP detected. TCP/5555 is selected by default; choose BL602 or LN882H depending on the hardware."
     firmwareVersion.isNotBlank() -> "AT commands responded. Magic Home / Zengge OTA path should be available."
     apName.isNotBlank() -> "WiFi connection is active, but AT diagnostics have not confirmed the firmware yet."
@@ -1521,6 +1738,7 @@ fun FilesTabContent(
     apViewModel: ApViewModel,
     onRefreshVendorFiles: () -> Unit,
     onDownloadVendorUrl: (String) -> Unit,
+    onImportVendorFile: () -> Unit,
     onRefreshVendorCatalog: (String) -> Unit,
     onDownloadVendorCatalogItem: (VendorCatalogItem) -> Unit
 ) {
@@ -1578,6 +1796,12 @@ fun FilesTabContent(
                 ) {
                     Text("Refresh")
                 }
+            }
+            FilledTonalButton(
+                onClick = onImportVendorFile,
+                modifier = Modifier.fillMaxWidth()
+            ) {
+                Text("Import local OTA file")
             }
         }
 
