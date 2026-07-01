@@ -16,6 +16,7 @@ object OtaPatcher {
     fun buildOtaFile(
         rawPayload: ByteArray,
         headerTemplate: ByteArray,
+        injectWifiConfig: Boolean,
         ssid: String,
         password: String,
         hostname: String,
@@ -24,10 +25,12 @@ object OtaPatcher {
         val offset = findStructOffset(rawPayload)
         if (offset == null) {
             log("OBKCFG1: struct NOT found in firmware — WiFi config NOT injected")
+        } else if (!injectWifiConfig) {
+            log("OBKCFG1: found at 0x${offset.toString(16)}, WiFi config injection disabled")
         } else {
             log("OBKCFG1: found at 0x${offset.toString(16)}, injecting ssid='$ssid' pass=${if (password.isEmpty()) "(empty)" else "***"} hostname='$hostname'")
         }
-        val patched = if (offset != null) {
+        val patched = if (offset != null && injectWifiConfig) {
             val p = rawPayload.copyOf()
             buildStruct(ssid, password, hostname).copyInto(p, offset)
             // verify

@@ -2,8 +2,11 @@ package com.lance3.mhflasher
 
 import ApViewModel
 import FirmwareImage
+import FirmwareSource
 import LogViewModel
 import TargetMcu
+import VendorCatalogItem
+import VendorOtaFile
 import WifiAP
 import android.Manifest
 import android.content.BroadcastReceiver
@@ -11,20 +14,24 @@ import android.content.Context
 import android.content.Intent
 import android.content.IntentFilter
 import android.content.pm.PackageManager
+import android.database.Cursor
 import android.net.ConnectivityManager
 import android.net.LinkProperties
 import android.net.Network
 import android.net.NetworkCapabilities
 import android.net.NetworkRequest
+import android.net.Uri
 import android.net.wifi.ScanResult
 import android.net.wifi.WifiManager
 import android.net.wifi.WifiNetworkSpecifier
 import android.os.Build
 import android.os.Bundle
+import android.provider.OpenableColumns
 import android.util.Log
 import android.widget.Toast
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.annotation.RequiresApi
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
@@ -83,15 +90,20 @@ import androidx.core.content.ContextCompat
 import com.lance3.mhflasher.ui.theme.MagicHomeFlasherTheme
 import java.io.BufferedOutputStream
 import java.io.BufferedReader
+import java.io.File
 import java.io.IOException
 import java.io.InputStreamReader
 import java.net.DatagramPacket
 import java.net.DatagramSocket
+import java.net.HttpURLConnection
 import java.net.Inet4Address
 import java.net.InetAddress
 import java.net.ServerSocket
 import java.net.Socket
 import java.net.SocketTimeoutException
+import java.net.URL
+import java.security.MessageDigest
+import org.json.JSONObject
 
 object Constants {
     const val OTA_PORT = 1111
@@ -112,13 +124,21 @@ enum class CMD(val str: String){
 
 enum class OtaTrigger {
     AT_UPURL,
-    TCP_OTA
+    TCP_OTA,
+    OPENBEKEN_HTTP
 }
 
 class MainActivity : ComponentActivity() {
     private val logViewModel = LogViewModel()
     private val apViewModel: ApViewModel by viewModels()
     private var httpRequestCount = 0
+    private val vendorOtaPicker = registerForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
+        if (uri != null) {
+            importVendorOtaFromUri(uri)
+        } else {
+            logViewModel.addLog("Vendor OTA import cancelled")
+        }
+    }
     companion object {
         const val MY_PERMISSIONS_REQUEST_LOCATION = 1
     }
@@ -127,10 +147,243 @@ class MainActivity : ComponentActivity() {
         Log.d("LOG","On create")
         setContent {
             MagicHomeFlasherTheme {
-                MyApp(logViewModel, apViewModel, {wifiCheckAndScan()}, {ap -> wifiConnect(ap)},{ip -> checkDeviceByIP(ip)}, {trigger -> prepareOtaAndFlash(applicationContext, trigger)}, {wifiReadConfig()}, {wifiSetAndReboot()})
+                MyApp(
+                    logViewModel,
+                    apViewModel,
+                    { wifiCheckAndScan() },
+                    { ap -> wifiConnect(ap) },
+                    { ip -> checkDeviceByIP(ip) },
+                    { trigger -> prepareOtaAndFlash(applicationContext, trigger) },
+                    {
+                        apViewModel.resetFlashState()
+                        logViewModel.addLog("Flash stopped by user; ready to retry")
+                    },
+                    { wifiReadConfig() },
+                    { wifiSetAndReboot() },
+                    { refreshVendorOtaFiles() },
+                    { url -> downloadVendorOta(url) },
+                    { vendorOtaPicker.launch(arrayOf("*/*")) },
+                    { url -> refreshVendorCatalog(url) },
+                    { item -> downloadVendorCatalogItem(item) }
+                )
             }
         }
         startHttpServer(applicationContext)
+        refreshVendorOtaFiles()
+    }
+
+    private fun vendorOtaDir(): File =
+        File(getExternalFilesDir(null), "vendor_ota").apply { mkdirs() }
+
+    private fun displayNameForUri(uri: Uri): String {
+        var cursor: Cursor? = null
+        return try {
+            cursor = contentResolver.query(uri, arrayOf(OpenableColumns.DISPLAY_NAME), null, null, null)
+            if (cursor != null && cursor.moveToFirst()) {
+                val index = cursor.getColumnIndex(OpenableColumns.DISPLAY_NAME)
+                if (index >= 0) cursor.getString(index) else null
+            } else {
+                null
+            }
+        } catch (_: Exception) {
+            null
+        } finally {
+            cursor?.close()
+        } ?: uri.lastPathSegment?.substringAfterLast('/') ?: "vendor_${System.currentTimeMillis()}.xz.ota"
+    }
+
+    private fun importVendorOtaFromUri(uri: Uri) {
+        Thread {
+            try {
+                val rawName = displayNameForUri(uri)
+                val fileName = rawName.replace(Regex("[^A-Za-z0-9._-]"), "_")
+                val outFile = File(vendorOtaDir(), fileName)
+                var total = 0L
+
+                contentResolver.openInputStream(uri).use { input ->
+                    if (input == null) throw IOException("unable to open selected file")
+                    outFile.outputStream().use { output ->
+                        val buffer = ByteArray(32 * 1024)
+                        while (true) {
+                            val read = input.read(buffer)
+                            if (read < 0) break
+                            output.write(buffer, 0, read)
+                            total += read
+                        }
+                    }
+                }
+
+                if (total <= 0) throw IOException("selected file is empty")
+
+                val sha256 = sha256Hex(outFile)
+                mainThread {
+                    apViewModel.selectedVendorOtaPath.value = outFile.absolutePath
+                    apViewModel.firmwareSource.value = FirmwareSource.VENDOR_RESTORE
+                    apViewModel.targetMcu.value = TargetMcu.BL602
+                    apViewModel.otaBytes = null
+                }
+                refreshVendorOtaFiles()
+                logViewModel.addLog("Vendor OTA: imported ${outFile.name} ($total bytes)")
+                logViewModel.addLog("Vendor OTA: sha256 ${sha256.take(12)}...")
+                logViewModel.addLog("Vendor OTA: selected ${outFile.name}")
+            } catch (e: Exception) {
+                logViewModel.addLog("Vendor OTA import failed: ${e.javaClass.simpleName}: ${e.message}")
+            }
+        }.start()
+    }
+
+    private fun refreshVendorOtaFiles() {
+        val files = vendorOtaDir()
+            .listFiles { file -> file.isFile && file.name.endsWith(".ota", ignoreCase = true) }
+            ?.sortedBy { it.name.lowercase() }
+            .orEmpty()
+            .map { VendorOtaFile(it.name, it.absolutePath, it.length()) }
+
+        mainThread {
+            apViewModel.vendorOtaFiles.clear()
+            apViewModel.vendorOtaFiles.addAll(files)
+            if (apViewModel.selectedVendorOtaPath.value.isBlank() && files.isNotEmpty()) {
+                apViewModel.selectedVendorOtaPath.value = files.first().path
+            }
+            if (apViewModel.selectedVendorOtaPath.value.isNotBlank() && files.none { it.path == apViewModel.selectedVendorOtaPath.value }) {
+                apViewModel.selectedVendorOtaPath.value = files.firstOrNull()?.path.orEmpty()
+            }
+        }
+    }
+
+    private fun downloadVendorOta(url: String) {
+        downloadVendorOta(url, preferredFileName = null, expectedSha256 = null, expectedSize = null)
+    }
+
+    private fun downloadVendorOta(
+        url: String,
+        preferredFileName: String?,
+        expectedSha256: String?,
+        expectedSize: Long?
+    ) {
+        if (url.isBlank()) {
+            logViewModel.addLog("Vendor OTA: URL is empty")
+            return
+        }
+
+        Thread {
+            try {
+                val parsed = URL(url)
+                val rawName = preferredFileName
+                    ?.takeIf { it.isNotBlank() }
+                    ?: parsed.path.substringAfterLast('/').ifBlank { "vendor_${System.currentTimeMillis()}.xz.ota" }
+                val fileName = rawName.replace(Regex("[^A-Za-z0-9._-]"), "_")
+                val outFile = File(vendorOtaDir(), fileName)
+
+                logViewModel.addLog("Vendor OTA: downloading $url")
+                parsed.openConnection().apply {
+                    connectTimeout = 15000
+                    readTimeout = 60000
+                }.getInputStream().use { input ->
+                    outFile.outputStream().use { output ->
+                        val buffer = ByteArray(32 * 1024)
+                        var total = 0L
+                        while (true) {
+                            val read = input.read(buffer)
+                            if (read < 0) break
+                            output.write(buffer, 0, read)
+                            total += read
+                        }
+                        if (expectedSize != null && total != expectedSize) {
+                            throw IOException("size mismatch: got $total, expected $expectedSize")
+                        }
+                        if (!expectedSha256.isNullOrBlank()) {
+                            val sha256 = sha256Hex(outFile)
+                            if (!sha256.equals(expectedSha256, ignoreCase = true)) {
+                                throw IOException("sha256 mismatch: got $sha256, expected $expectedSha256")
+                            }
+                            logViewModel.addLog("Vendor OTA: sha256 ${sha256.take(12)}... ok")
+                        }
+                        logViewModel.addLog("Vendor OTA: saved ${outFile.name} ($total bytes)")
+                    }
+                }
+                mainThread {
+                    apViewModel.selectedVendorOtaPath.value = outFile.absolutePath
+                    apViewModel.firmwareSource.value = FirmwareSource.VENDOR_RESTORE
+                    apViewModel.targetMcu.value = TargetMcu.BL602
+                    apViewModel.otaBytes = null
+                }
+                refreshVendorOtaFiles()
+                logViewModel.addLog("Vendor OTA: selected ${outFile.name}")
+            } catch (e: Exception) {
+                logViewModel.addLog("Vendor OTA download failed: ${e.javaClass.simpleName}: ${e.message}")
+            }
+        }.start()
+    }
+
+    private fun refreshVendorCatalog(url: String) {
+        if (url.isBlank()) {
+            logViewModel.addLog("Vendor catalog: URL is empty")
+            return
+        }
+
+        apViewModel.vendorCatalogUrl.value = url
+        apViewModel.saveVendorCatalogUrl()
+
+        Thread {
+            try {
+                logViewModel.addLog("Vendor catalog: downloading $url")
+                val text = URL(url).openConnection().apply {
+                    connectTimeout = 15000
+                    readTimeout = 30000
+                }.getInputStream().bufferedReader().use { it.readText() }
+
+                val root = JSONObject(text)
+                val itemsJson = root.getJSONArray("items")
+                val items = mutableListOf<VendorCatalogItem>()
+                for (i in 0 until itemsJson.length()) {
+                    val obj = itemsJson.getJSONObject(i)
+                    items.add(
+                        VendorCatalogItem(
+                            id = obj.optString("id"),
+                            title = obj.optString("title", obj.optString("file")),
+                            vendor = obj.optString("vendor"),
+                            mcu = obj.optString("mcu"),
+                            file = obj.optString("file"),
+                            url = obj.getString("url"),
+                            size = obj.optLong("size", -1L),
+                            sha256 = obj.optString("sha256"),
+                            experimental = obj.optBoolean("experimental", true)
+                        )
+                    )
+                }
+                mainThread {
+                    apViewModel.vendorCatalogItems.clear()
+                    apViewModel.vendorCatalogItems.addAll(items)
+                }
+                logViewModel.addLog("Vendor catalog: loaded ${items.size} entries")
+            } catch (e: Exception) {
+                logViewModel.addLog("Vendor catalog failed: ${e.javaClass.simpleName}: ${e.message}")
+            }
+        }.start()
+    }
+
+    private fun downloadVendorCatalogItem(item: VendorCatalogItem) {
+        logViewModel.addLog("Vendor catalog: selected ${item.title}")
+        downloadVendorOta(
+            item.url,
+            preferredFileName = item.file,
+            expectedSha256 = item.sha256.ifBlank { null },
+            expectedSize = item.size.takeIf { it >= 0 }
+        )
+    }
+
+    private fun sha256Hex(file: File): String {
+        val digest = MessageDigest.getInstance("SHA-256")
+        file.inputStream().use { input ->
+            val buffer = ByteArray(32 * 1024)
+            while (true) {
+                val read = input.read(buffer)
+                if (read < 0) break
+                digest.update(buffer, 0, read)
+            }
+        }
+        return digest.digest().joinToString("") { "%02x".format(it) }
     }
 
     private fun scanSuccess(results: List<ScanResult>?, wifiscanReceiver: BroadcastReceiver) {
@@ -278,7 +531,9 @@ class MainActivity : ComponentActivity() {
                     logViewModel.addLog("Device gateway IP: $deviceIp${if (firstDnsServer != null) " (DNS=$firstDnsServer ignored)" else ""}")
                     apViewModel.remoteIP.value = deviceIp
                     val deviceAddress = convertToInetAddress(deviceIp)
-                    if (deviceAddress != null && apViewModel.targetMcu.value == TargetMcu.BL602 && !isCozyLifeAp(ap.name)) {
+                    if (isOpenBekenAp(ap.name)) {
+                        fetchOpenBekenInfo(deviceIp)
+                    } else if (deviceAddress != null && apViewModel.targetMcu.value == TargetMcu.BL602 && !isCozyLifeAp(ap.name)) {
                         sendUdpPacket(deviceAddress, Constants.CMD_PORT, CMD.INFO)
                     } else {
                         logViewModel.addLog("Skipping UDP AT discovery for TCP-only device path")
@@ -300,6 +555,11 @@ class MainActivity : ComponentActivity() {
                 super.onLost(network)
                 logViewModel.addLog("Lost connection to ${ap.name}")
                 apViewModel.isConnected.value = false
+                val phase = apViewModel.flashPhase.value
+                if (phase != FlashPhase.IDLE && phase != FlashPhase.DONE && phase != FlashPhase.ERROR) {
+                    logViewModel.addLog("Flash interrupted: WiFi network was lost")
+                    apViewModel.flashPhase.value = FlashPhase.ERROR
+                }
             }
         }
 
@@ -315,8 +575,48 @@ class MainActivity : ComponentActivity() {
                 Toast.LENGTH_LONG
             ).show()
         } else {
-            sendUdpPacket(ip,Constants.CMD_PORT,CMD.INFO)
+            if (isOpenBekenAp(apViewModel.connectedAP.value)) {
+                fetchOpenBekenInfo(ipString)
+            } else {
+                sendUdpPacket(ip, Constants.CMD_PORT, CMD.INFO)
+            }
         }
+    }
+
+    private fun fetchOpenBekenInfo(ip: String) {
+        Thread {
+            try {
+                val url = "http://$ip/api/info"
+                logViewModel.addLog("OpenBeken info: requesting $url")
+                val text = URL(url).openConnection().apply {
+                    connectTimeout = 5000
+                    readTimeout = 10000
+                }.getInputStream().bufferedReader().use { it.readText() }
+
+                val obj = JSONObject(text)
+                val build = obj.optString("build")
+                val chipset = obj.optString("chipset")
+                val mac = obj.optString("mac")
+                val shortName = obj.optString("shortName")
+                val reportedIp = obj.optString("ip")
+
+                mainThread {
+                    apViewModel.firmwareVersion.value = build.ifBlank { "OpenBeken" }
+                    apViewModel.macAddress.value = mac
+                    apViewModel.deviceId.value = listOf(shortName, chipset)
+                        .filter { it.isNotBlank() }
+                        .joinToString(" / ")
+                    if (reportedIp.isNotBlank()) {
+                        apViewModel.remoteIP.value = reportedIp
+                    }
+                }
+
+                logViewModel.addLog("OpenBeken info: build=${build.ifBlank { "-" }}")
+                logViewModel.addLog("OpenBeken info: chipset=${chipset.ifBlank { "-" }} shortName=${shortName.ifBlank { "-" }} mac=${mac.ifBlank { "-" }}")
+            } catch (e: Exception) {
+                logViewModel.addLog("OpenBeken info failed: ${e.javaClass.simpleName}: ${e.message}")
+            }
+        }.start()
     }
 
     fun convertToInetAddress(ipInput: String): InetAddress? {
@@ -453,6 +753,93 @@ class MainActivity : ComponentActivity() {
                 }
             } catch (e: Exception) {
                 logViewModel.addLog("TCP OTA error: ${e.message}")
+                mainThread { apViewModel.flashPhase.value = FlashPhase.ERROR }
+            }
+        }.start()
+    }
+
+    private fun flashDeviceOpenBekenHttp() {
+        val ip = apViewModel.remoteIP.value
+        if (convertToInetAddress(ip) == null) {
+            logViewModel.addLog("Invalid IP address: $ip")
+            return
+        }
+
+        Thread {
+            try {
+                val bytes = apViewModel.otaBytes
+                if (bytes == null) {
+                    logViewModel.addLog("OpenBeken OTA: firmware is not ready")
+                    mainThread { apViewModel.flashPhase.value = FlashPhase.ERROR }
+                    return@Thread
+                }
+
+                val uploadUrl = "http://$ip/api/ota"
+                logViewModel.addLog("OpenBeken OTA: uploading ${bytes.size} bytes to $uploadUrl")
+                mainThread {
+                    apViewModel.flashProgress.value = 0f
+                    apViewModel.flashPhase.value = FlashPhase.UPLOADING
+                }
+
+                val uploadConnection = (URL(uploadUrl).openConnection() as HttpURLConnection).apply {
+                    requestMethod = "POST"
+                    connectTimeout = 5000
+                    readTimeout = 120000
+                    doOutput = true
+                    setRequestProperty("Content-Type", "application/octet-stream")
+                    setRequestProperty("Connection", "close")
+                    setFixedLengthStreamingMode(bytes.size)
+                }
+
+                var sent = 0
+                val chunkSize = 10 * 1024
+                uploadConnection.outputStream.use { output ->
+                    while (sent < bytes.size) {
+                        val len = minOf(chunkSize, bytes.size - sent)
+                        output.write(bytes, sent, len)
+                        sent += len
+                        val progress = sent.toFloat() / bytes.size
+                        logViewModel.addLog("OpenBeken OTA: sent $sent/${bytes.size} bytes")
+                        mainThread { apViewModel.flashProgress.value = progress }
+                    }
+                    output.flush()
+                }
+
+                val uploadCode = uploadConnection.responseCode
+                val uploadResponse = try {
+                    val stream = if (uploadCode in 200..399) uploadConnection.inputStream else uploadConnection.errorStream
+                    stream?.bufferedReader()?.use { it.readText().take(240) }.orEmpty()
+                } finally {
+                    uploadConnection.disconnect()
+                }
+                logViewModel.addLog("OpenBeken OTA: HTTP $uploadCode")
+                if (uploadResponse.isNotBlank()) {
+                    logViewModel.addLog("OpenBeken OTA: ${uploadResponse.replace(Regex("\\s+"), " ")}")
+                }
+                if (uploadCode !in 200..399) {
+                    mainThread { apViewModel.flashPhase.value = FlashPhase.ERROR }
+                    return@Thread
+                }
+
+                logViewModel.addLog("OpenBeken OTA: upload accepted, restarting device")
+                val rebootConnection = (URL("http://$ip/api/reboot").openConnection() as HttpURLConnection).apply {
+                    requestMethod = "POST"
+                    connectTimeout = 5000
+                    readTimeout = 10000
+                    setRequestProperty("Connection", "close")
+                }
+                val rebootCode = rebootConnection.responseCode
+                val rebootResponse = try {
+                    val stream = if (rebootCode in 200..399) rebootConnection.inputStream else rebootConnection.errorStream
+                    stream?.bufferedReader()?.use { it.readText().take(120) }.orEmpty()
+                } finally {
+                    rebootConnection.disconnect()
+                }
+                logViewModel.addLog("OpenBeken OTA reboot: HTTP $rebootCode ${rebootResponse.replace(Regex("\\s+"), " ")}")
+                logViewModel.addLog("Flash sent. Wait 15-30 seconds; if the device does not appear, power-cycle it manually.")
+                mainThread { apViewModel.flashPhase.value = FlashPhase.DONE }
+            } catch (e: Exception) {
+                logViewModel.addLog("OpenBeken OTA error: ${e.javaClass.simpleName}: ${e.message}")
                 mainThread { apViewModel.flashPhase.value = FlashPhase.ERROR }
             }
         }.start()
@@ -608,11 +995,46 @@ class MainActivity : ComponentActivity() {
         context: Context,
         trigger: OtaTrigger
     ) {
-        mainThread { apViewModel.flashPhase.value = FlashPhase.PATCHING }
+        apViewModel.otaBytes = null
+        mainThread {
+            apViewModel.flashProgress.value = 0f
+            apViewModel.flashPhase.value = FlashPhase.PATCHING
+        }
         Thread {
             try {
                 when (apViewModel.targetMcu.value) {
                     TargetMcu.BL602 -> {
+                        if (apViewModel.firmwareSource.value == FirmwareSource.VENDOR_RESTORE) {
+                            val selectedPath = apViewModel.selectedVendorOtaPath.value
+                            if (selectedPath.isBlank()) {
+                                logViewModel.addLog("Vendor OTA: no local file selected")
+                                mainThread { apViewModel.flashPhase.value = FlashPhase.ERROR }
+                                return@Thread
+                            }
+
+                            val vendorFile = File(selectedPath)
+                            if (!vendorFile.isFile) {
+                                logViewModel.addLog("Vendor OTA: selected file is missing: $selectedPath")
+                                refreshVendorOtaFiles()
+                                mainThread { apViewModel.flashPhase.value = FlashPhase.ERROR }
+                                return@Thread
+                            }
+
+                            val bytes = vendorFile.readBytes()
+                            if (!bytes.copyOfRange(0, minOf(bytes.size, 16)).contentEquals("BL60X_OTA_Ver1.0".toByteArray())) {
+                                logViewModel.addLog("Vendor OTA: warning, BL60X OTA magic not found")
+                            }
+                            apViewModel.otaBytes = bytes
+                            logViewModel.addLog("Vendor OTA ready: ${vendorFile.name}, ${bytes.size} bytes")
+                            mainThread { apViewModel.flashPhase.value = FlashPhase.READY }
+                            when (trigger) {
+                                OtaTrigger.AT_UPURL -> flashDevice()
+                                OtaTrigger.TCP_OTA -> flashDeviceTcpOta()
+                                OtaTrigger.OPENBEKEN_HTTP -> flashDeviceOpenBekenHttp()
+                            }
+                            return@Thread
+                        }
+
                         val image = apViewModel.firmwareImage.value
                         val rawPayloadAsset = when (image) {
                             FirmwareImage.STANDARD -> "OpenBL602_dev_20260625_142543_OTA.bin"
@@ -625,17 +1047,19 @@ class MainActivity : ComponentActivity() {
                         mainThread { apViewModel.flashPhase.value = FlashPhase.COMPRESSING }
                         logViewModel.addLog("Compressing (XZ)... this may take a few seconds")
                         val injectWifi = apViewModel.preconfigureWifi.value
+                        logViewModel.addLog("WiFi preconfigure: ${if (injectWifi) "enabled" else "disabled"}")
                         val built = OtaPatcher.buildOtaFile(
                             rawPayload, headerTemplate,
-                            if (injectWifi) apViewModel.wifiSsid.value else "",
-                            if (injectWifi) apViewModel.wifiPassword.value else "",
-                            if (injectWifi) apViewModel.wifiHostname.value else "",
+                            injectWifi,
+                            apViewModel.wifiSsid.value,
+                            apViewModel.wifiPassword.value,
+                            apViewModel.wifiHostname.value,
                             log = { logViewModel.addLog(it) }
                         )
                         apViewModel.otaBytes = built
                         logViewModel.addLog("BL602 firmware ready: ${built.size} bytes")
                         val otaPayloadLen = readLe32(built, 0x14)
-                        if (trigger != OtaTrigger.AT_UPURL && otaPayloadLen > Constants.TCP_OTA_FW_LIMIT) {
+                        if (trigger == OtaTrigger.TCP_OTA && otaPayloadLen > Constants.TCP_OTA_FW_LIMIT) {
                             logViewModel.addLog(
                                 "TCP OTA image too large: payload $otaPayloadLen > FW ${Constants.TCP_OTA_FW_LIMIT} bytes"
                             )
@@ -656,6 +1080,7 @@ class MainActivity : ComponentActivity() {
                         when (trigger) {
                             OtaTrigger.AT_UPURL -> flashDevice()
                             OtaTrigger.TCP_OTA -> flashDeviceTcpOta()
+                            OtaTrigger.OPENBEKEN_HTTP -> flashDeviceOpenBekenHttp()
                         }
                     }
 
@@ -704,12 +1129,18 @@ fun MyApp(
     onConnectClick: (WifiAP) -> kotlin.Unit,
     onCheckDeviceClick: (String) -> Unit,
     onFlashClick: (OtaTrigger) -> Unit,
+    onStopFlashClick: () -> Unit,
     onWifiReadClick: () -> Unit,
     onWifiSetClick: () -> Unit,
+    onRefreshVendorFiles: () -> Unit,
+    onDownloadVendorUrl: (String) -> Unit,
+    onImportVendorFile: () -> Unit,
+    onRefreshVendorCatalog: (String) -> Unit,
+    onDownloadVendorCatalogItem: (VendorCatalogItem) -> Unit,
     selTab: Int = 0
 ) {
     var tabIndex by remember { mutableIntStateOf(selTab) }
-    val tabTitles = listOf("flash", "log", "about")
+    val tabTitles = listOf("flash", "files", "log", "about")
     Column(modifier = Modifier.fillMaxSize()) {
         TabRow(selectedTabIndex = tabIndex) {
             tabTitles.forEachIndexed { index, title ->
@@ -720,8 +1151,9 @@ fun MyApp(
             }
         }
         when (tabIndex) {
-            0 -> MainTabContent(logViewModel,apViewModel,onScanClick,onConnectClick, onCheckDeviceClick, onFlashClick, onWifiReadClick, onWifiSetClick)
-            1 -> LogTabContent(logViewModel)
+            0 -> MainTabContent(logViewModel,apViewModel,onScanClick,onConnectClick, onCheckDeviceClick, onFlashClick, onStopFlashClick, onWifiReadClick, onWifiSetClick)
+            1 -> FilesTabContent(apViewModel, onRefreshVendorFiles, onDownloadVendorUrl, onImportVendorFile, onRefreshVendorCatalog, onDownloadVendorCatalogItem)
+            2 -> LogTabContent(logViewModel)
         }
     }
 }
@@ -763,14 +1195,23 @@ fun MainTabContent(
     onConnectClick: (WifiAP) -> Unit,
     onCheckDeviceClick: (String) -> Unit,
     onFlashClick: (OtaTrigger) -> Unit,
+    onStopFlashClick: () -> Unit,
     onWifiReadClick: () -> Unit,
     onWifiSetClick: () -> Unit
 ) {
     val connectedAp = apViewModel.connectedAP.value
     val looksCozyLife = isCozyLifeAp(connectedAp)
+    val looksOpenBeken = isOpenBekenAp(connectedAp)
     val targetMcu = apViewModel.targetMcu.value
+    val firmwareSource = apViewModel.firmwareSource.value
     var flashMethod by remember(connectedAp) {
-        mutableStateOf(if (looksCozyLife) OtaTrigger.TCP_OTA else OtaTrigger.AT_UPURL)
+        mutableStateOf(
+            when {
+                looksOpenBeken -> OtaTrigger.OPENBEKEN_HTTP
+                looksCozyLife -> OtaTrigger.TCP_OTA
+                else -> OtaTrigger.AT_UPURL
+            }
+        )
     }
     val preconfigureWifi = apViewModel.preconfigureWifi.value
     val targetSsid = apViewModel.wifiSsid.value
@@ -787,11 +1228,17 @@ fun MainTabContent(
         if (connectedAp.isNotBlank()) {
             apViewModel.firmwareImage.value = if (looksCozyLife) FirmwareImage.SMALL else FirmwareImage.STANDARD
         }
+        if (looksOpenBeken) {
+            apViewModel.targetMcu.value = TargetMcu.BL602
+            apViewModel.firmwareSource.value = FirmwareSource.VENDOR_RESTORE
+            flashMethod = OtaTrigger.OPENBEKEN_HTTP
+        }
     }
 
     LaunchedEffect(targetMcu) {
         if (targetMcu == TargetMcu.LN882H) {
             flashMethod = OtaTrigger.TCP_OTA
+            apViewModel.firmwareSource.value = FirmwareSource.OPENBEKEN
         }
     }
 
@@ -853,7 +1300,7 @@ fun MainTabContent(
                         onClick = { onCheckDeviceClick(apViewModel.remoteIP.value) },
                         modifier = Modifier.fillMaxWidth()
                     ) {
-                        Text("Retry AT discovery")
+                        Text(if (looksOpenBeken) "Retry OpenBeken info" else "Retry AT discovery")
                     }
                 } else if (targetMcu == TargetMcu.LN882H) {
                     Text(
@@ -898,23 +1345,65 @@ fun MainTabContent(
                     selected = flashMethod == OtaTrigger.TCP_OTA,
                     onClick = { flashMethod = OtaTrigger.TCP_OTA }
                 )
+                OptionRow(
+                    title = "OpenBeken REST upload",
+                    subtitle = "For devices already running OpenBeken. Uploads the selected OTA to /api/ota and restarts.",
+                    selected = flashMethod == OtaTrigger.OPENBEKEN_HTTP,
+                    enabled = targetMcu == TargetMcu.BL602,
+                    onClick = { flashMethod = OtaTrigger.OPENBEKEN_HTTP }
+                )
 
                 Divider()
 
                 if (targetMcu == TargetMcu.BL602) {
+                    Text("Firmware source", style = MaterialTheme.typography.titleSmall)
+                    OptionRow(
+                        title = "OpenBeken",
+                        subtitle = "Build bundled with the app. Can patch OTA header and optionally inject WiFi config.",
+                        selected = firmwareSource == FirmwareSource.OPENBEKEN,
+                        onClick = { apViewModel.firmwareSource.value = FirmwareSource.OPENBEKEN }
+                    )
+                    OptionRow(
+                        title = "Vendor restore OTA",
+                        subtitle = "Serve a locally cached BL602 .ota file, without patching or WiFi injection.",
+                        selected = firmwareSource == FirmwareSource.VENDOR_RESTORE,
+                        onClick = { apViewModel.firmwareSource.value = FirmwareSource.VENDOR_RESTORE }
+                    )
+
+                    Divider()
+
                     Text("Firmware image", style = MaterialTheme.typography.titleSmall)
-                    OptionRow(
-                        title = "Standard OpenBeken",
-                        subtitle = "Full 20260625 build. Supports OTA header patching and WiFi injection.",
-                        selected = apViewModel.firmwareImage.value == FirmwareImage.STANDARD,
-                        onClick = { apViewModel.firmwareImage.value = FirmwareImage.STANDARD }
-                    )
-                    OptionRow(
-                        title = "Small OpenBeken (1MB-safe)",
-                        subtitle = "Smaller 20260625 build for CozyLife devices with limited flash.",
-                        selected = apViewModel.firmwareImage.value == FirmwareImage.SMALL,
-                        onClick = { apViewModel.firmwareImage.value = FirmwareImage.SMALL }
-                    )
+                    if (firmwareSource == FirmwareSource.OPENBEKEN) {
+                        OptionRow(
+                            title = "Standard OpenBeken",
+                            subtitle = "Full 20260625 build. Supports OTA header patching and WiFi injection.",
+                            selected = apViewModel.firmwareImage.value == FirmwareImage.STANDARD,
+                            onClick = { apViewModel.firmwareImage.value = FirmwareImage.STANDARD }
+                        )
+                        OptionRow(
+                            title = "Small OpenBeken (1MB-safe)",
+                            subtitle = "Smaller 20260625 build for CozyLife devices with limited flash.",
+                            selected = apViewModel.firmwareImage.value == FirmwareImage.SMALL,
+                            onClick = { apViewModel.firmwareImage.value = FirmwareImage.SMALL }
+                        )
+                    } else {
+                        if (apViewModel.vendorOtaFiles.isEmpty()) {
+                            Text(
+                                "No local vendor OTA files. Use the files tab to download a .ota file before connecting to the device AP.",
+                                style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant
+                            )
+                        } else {
+                            apViewModel.vendorOtaFiles.forEach { file ->
+                                OptionRow(
+                                    title = file.name,
+                                    subtitle = "${file.size} bytes",
+                                    selected = apViewModel.selectedVendorOtaPath.value == file.path,
+                                    onClick = { apViewModel.selectedVendorOtaPath.value = file.path }
+                                )
+                            }
+                        }
+                    }
                 } else {
                     Text("Firmware image", style = MaterialTheme.typography.titleSmall)
                     Surface(
@@ -933,7 +1422,7 @@ fun MainTabContent(
 
                 Divider()
 
-                if (targetMcu == TargetMcu.BL602) {
+                if (targetMcu == TargetMcu.BL602 && firmwareSource == FirmwareSource.OPENBEKEN) {
                     Row(
                         modifier = Modifier.fillMaxWidth(),
                         horizontalArrangement = Arrangement.SpaceBetween,
@@ -993,28 +1482,53 @@ fun MainTabContent(
                 ) {
                     Column(modifier = Modifier.padding(12.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {
                         SummaryLine("Target", if (targetMcu == TargetMcu.LN882H) "LN882H" else "BL602")
-                        SummaryLine("Method", if (flashMethod == OtaTrigger.TCP_OTA) "CozyLife TCP/5555" else "AT UDP")
+                        SummaryLine(
+                            "Method",
+                            when (flashMethod) {
+                                OtaTrigger.TCP_OTA -> "CozyLife TCP/5555"
+                                OtaTrigger.OPENBEKEN_HTTP -> "OpenBeken REST"
+                                OtaTrigger.AT_UPURL -> "AT UDP"
+                            }
+                        )
                         SummaryLine(
                             "Image",
                             if (targetMcu == TargetMcu.LN882H) "OpenLN882H"
+                            else if (firmwareSource == FirmwareSource.VENDOR_RESTORE) {
+                                apViewModel.vendorOtaFiles.firstOrNull { it.path == apViewModel.selectedVendorOtaPath.value }?.name ?: "No vendor OTA selected"
+                            }
                             else if (apViewModel.firmwareImage.value == FirmwareImage.SMALL) "Small OpenBeken"
                             else "Standard OpenBeken"
                         )
                         SummaryLine(
                             "WiFi",
                             if (targetMcu == TargetMcu.LN882H) "unchanged by flasher"
+                            else if (firmwareSource == FirmwareSource.VENDOR_RESTORE) "unchanged by flasher"
                             else if (preconfigureWifi && targetSsid.isNotBlank()) "preconfigure $targetSsid"
                             else "OpenBeken AP pairing"
                         )
                     }
                 }
 
+                val hasVendorSelection = firmwareSource != FirmwareSource.VENDOR_RESTORE ||
+                    apViewModel.selectedVendorOtaPath.value.isNotBlank()
                 Button(
                     onClick = { if (!isFlashing) onFlashClick(flashMethod) },
-                    enabled = !isFlashing && (targetMcu == TargetMcu.LN882H || !preconfigureWifi || targetSsid.isNotBlank()),
+                    enabled = !isFlashing && hasVendorSelection && (targetMcu == TargetMcu.LN882H || firmwareSource == FirmwareSource.VENDOR_RESTORE || !preconfigureWifi || targetSsid.isNotBlank()),
                     modifier = Modifier.fillMaxWidth()
                 ) {
-                    Text(if (targetMcu == TargetMcu.LN882H) "Flash LN882H OpenBeken" else "Flash OpenBeken")
+                    Text(
+                        if (targetMcu == TargetMcu.LN882H) "Flash LN882H OpenBeken"
+                        else if (firmwareSource == FirmwareSource.VENDOR_RESTORE) "Flash vendor OTA"
+                        else "Flash OpenBeken"
+                    )
+                }
+                if (phase != FlashPhase.IDLE) {
+                    FilledTonalButton(
+                        onClick = onStopFlashClick,
+                        modifier = Modifier.fillMaxWidth()
+                    ) {
+                        Text("Stop / reset flash attempt")
+                    }
                 }
 
                 when (phase) {
@@ -1180,7 +1694,11 @@ fun SummaryLine(label: String, value: String) {
 fun isCozyLifeAp(apName: String): Boolean =
     apName.startsWith("CozyLife", ignoreCase = true)
 
+fun isOpenBekenAp(apName: String): Boolean =
+    apName.startsWith("OpenBL", ignoreCase = true)
+
 fun inferredDeviceSummary(apName: String, firmwareVersion: String): String = when {
+    isOpenBekenAp(apName) -> "OpenBeken AP detected. Vendor restore via OpenBeken REST is selected by default."
     isCozyLifeAp(apName) -> "CozyLife-like AP detected. TCP/5555 is selected by default; choose BL602 or LN882H depending on the hardware."
     firmwareVersion.isNotBlank() -> "AT commands responded. Magic Home / Zengge OTA path should be available."
     apName.isNotBlank() -> "WiFi connection is active, but AT diagnostics have not confirmed the firmware yet."
@@ -1214,6 +1732,139 @@ Button(onClick = { onCheckDeviceClick(apViewModel.remoteIP.value) }) {
     Text(text = "Check device")
 }
  */
+
+@Composable
+fun FilesTabContent(
+    apViewModel: ApViewModel,
+    onRefreshVendorFiles: () -> Unit,
+    onDownloadVendorUrl: (String) -> Unit,
+    onImportVendorFile: () -> Unit,
+    onRefreshVendorCatalog: (String) -> Unit,
+    onDownloadVendorCatalogItem: (VendorCatalogItem) -> Unit
+) {
+    var url by remember { mutableStateOf("") }
+    var catalogUrl by remember { mutableStateOf(apViewModel.vendorCatalogUrl.value) }
+
+    Column(
+        modifier = Modifier
+            .fillMaxSize()
+            .verticalScroll(rememberScrollState())
+            .padding(horizontal = 14.dp, vertical = 10.dp),
+        verticalArrangement = Arrangement.spacedBy(14.dp)
+    ) {
+        SectionCard("Vendor OTA cache") {
+            Text(
+                "Download vendor .ota files before connecting to the device AP. The flash tab can then serve the selected local file without internet access.",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant
+            )
+            OutlinedTextField(
+                value = catalogUrl,
+                onValueChange = { catalogUrl = it },
+                label = { Text("Catalog manifest URL") },
+                singleLine = false,
+                textStyle = TextStyle(color = MaterialTheme.colorScheme.onSurface),
+                modifier = Modifier.fillMaxWidth()
+            )
+            FilledTonalButton(
+                onClick = { onRefreshVendorCatalog(catalogUrl) },
+                modifier = Modifier.fillMaxWidth()
+            ) {
+                Text("Refresh online catalog")
+            }
+
+            Divider()
+
+            OutlinedTextField(
+                value = url,
+                onValueChange = { url = it },
+                label = { Text("Direct OTA file URL") },
+                singleLine = false,
+                textStyle = TextStyle(color = MaterialTheme.colorScheme.onSurface),
+                modifier = Modifier.fillMaxWidth()
+            )
+            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                Button(
+                    onClick = { onDownloadVendorUrl(url) },
+                    modifier = Modifier.weight(1f)
+                ) {
+                    Text("Download")
+                }
+                FilledTonalButton(
+                    onClick = { onRefreshVendorFiles() },
+                    modifier = Modifier.weight(1f)
+                ) {
+                    Text("Refresh")
+                }
+            }
+            FilledTonalButton(
+                onClick = onImportVendorFile,
+                modifier = Modifier.fillMaxWidth()
+            ) {
+                Text("Import local OTA file")
+            }
+        }
+
+        SectionCard("Online catalog") {
+            if (apViewModel.vendorCatalogItems.isEmpty()) {
+                Text(
+                    "No catalog entries loaded yet.",
+                    style = MaterialTheme.typography.bodyMedium,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
+            } else {
+                apViewModel.vendorCatalogItems.forEach { item ->
+                    Surface(
+                        shape = MaterialTheme.shapes.small,
+                        color = MaterialTheme.colorScheme.surfaceVariant,
+                        modifier = Modifier.fillMaxWidth()
+                    ) {
+                        Column(
+                            modifier = Modifier.padding(10.dp),
+                            verticalArrangement = Arrangement.spacedBy(6.dp)
+                        ) {
+                            Text(item.title, style = MaterialTheme.typography.bodyMedium, fontWeight = FontWeight.Medium)
+                            Text(
+                                "${item.vendor} ${item.mcu} - ${item.size} bytes",
+                                style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant
+                            )
+                            FilledTonalButton(
+                                onClick = { onDownloadVendorCatalogItem(item) },
+                                modifier = Modifier.fillMaxWidth()
+                            ) {
+                                Text("Download to local cache")
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        SectionCard("Local vendor OTA files") {
+            if (apViewModel.vendorOtaFiles.isEmpty()) {
+                Text(
+                    "No local .ota files found yet.",
+                    style = MaterialTheme.typography.bodyMedium,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
+            } else {
+                apViewModel.vendorOtaFiles.forEach { file ->
+                    OptionRow(
+                        title = file.name,
+                        subtitle = "${file.size} bytes",
+                        selected = apViewModel.selectedVendorOtaPath.value == file.path,
+                        onClick = {
+                            apViewModel.selectedVendorOtaPath.value = file.path
+                            apViewModel.firmwareSource.value = FirmwareSource.VENDOR_RESTORE
+                            apViewModel.targetMcu.value = TargetMcu.BL602
+                        }
+                    )
+                }
+            }
+        }
+    }
+}
 
 @Composable
 fun LogTabContent(logViewModel: LogViewModel) {
