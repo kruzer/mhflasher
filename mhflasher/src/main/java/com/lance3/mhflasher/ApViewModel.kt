@@ -36,7 +36,9 @@ class ApViewModel(application: Application) : AndroidViewModel(application) {
     var firmwareSource = mutableStateOf(FirmwareSource.OPENBEKEN)
     var firmwareImage = mutableStateOf(FirmwareImage.SMALL)
     val vendorOtaFiles = mutableStateListOf<VendorOtaFile>()
+    val vendorCatalogItems = mutableStateListOf<VendorCatalogItem>()
     var selectedVendorOtaPath = mutableStateOf("")
+    var vendorCatalogUrl = mutableStateOf(prefs.getString("vendorCatalogUrl", DEFAULT_VENDOR_CATALOG_URL) ?: DEFAULT_VENDOR_CATALOG_URL)
     var otaBytes: ByteArray? = null
     var useNewOtaFormat = mutableStateOf(false)
     var preconfigureWifi = mutableStateOf(prefs.getBoolean("preconfigureWifi", false))
@@ -53,6 +55,12 @@ class ApViewModel(application: Application) : AndroidViewModel(application) {
             .apply()
     }
 
+    fun saveVendorCatalogUrl() {
+        prefs.edit()
+            .putString("vendorCatalogUrl", vendorCatalogUrl.value)
+            .apply()
+    }
+
     fun addAccessPoint(ap: WifiAP) {
         accessPoints.add(ap)
     }
@@ -63,3 +71,17 @@ class ApViewModel(application: Application) : AndroidViewModel(application) {
 
 data class WifiAP(val name: String, val rssi: Int)
 data class VendorOtaFile(val name: String, val path: String, val size: Long)
+data class VendorCatalogItem(
+    val id: String,
+    val title: String,
+    val vendor: String,
+    val mcu: String,
+    val file: String,
+    val url: String,
+    val size: Long,
+    val sha256: String,
+    val experimental: Boolean
+)
+
+const val DEFAULT_VENDOR_CATALOG_URL =
+    "https://github.com/kruzer/mhflasher/releases/download/vendor-bl602-magic-home-sample-20260701/manifest.json"

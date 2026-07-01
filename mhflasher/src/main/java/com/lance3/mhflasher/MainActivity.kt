@@ -5,6 +5,7 @@ import FirmwareImage
 import FirmwareSource
 import LogViewModel
 import TargetMcu
+import VendorCatalogItem
 import VendorOtaFile
 import WifiAP
 import android.Manifest
@@ -98,6 +99,8 @@ import java.net.Socket
 import java.net.SocketTimeoutException
 import java.net.URLEncoder
 import java.net.URL
+import java.security.MessageDigest
+import org.json.JSONObject
 
 object Constants {
     const val OTA_PORT = 1111
@@ -144,7 +147,9 @@ class MainActivity : ComponentActivity() {
                     { wifiReadConfig() },
                     { wifiSetAndReboot() },
                     { refreshVendorOtaFiles() },
-                    { url -> downloadVendorOta(url) }
+                    { url -> downloadVendorOta(url) },
+                    { url -> refreshVendorCatalog(url) },
+                    { item -> downloadVendorCatalogItem(item) }
                 )
             }
         }
@@ -175,6 +180,10 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun downloadVendorOta(url: String) {
+        downloadVendorOta(url, expectedSha256 = null, expectedSize = null)
+    }
+
+    private fun downloadVendorOta(url: String, expectedSha256: String?, expectedSize: Long?) {
         if (url.isBlank()) {
             logViewModel.addLog("Vendor OTA: URL is empty")
             return
@@ -201,6 +210,15 @@ class MainActivity : ComponentActivity() {
                             output.write(buffer, 0, read)
                             total += read
                         }
+                        if (expectedSize != null && total != expectedSize) {
+                            throw IOException("size mismatch: got $total, expected $expectedSize")
+                        }
+                        if (!expectedSha256.isNullOrBlank()) {
+                            val sha256 = sha256Hex(outFile)
+                            if (!sha256.equals(expectedSha256, ignoreCase = true)) {
+                                throw IOException("sha256 mismatch: got $sha256, expected $expectedSha256")
+                            }
+                        }
                         logViewModel.addLog("Vendor OTA: saved ${outFile.name} ($total bytes)")
                     }
                 }
@@ -209,6 +227,75 @@ class MainActivity : ComponentActivity() {
                 logViewModel.addLog("Vendor OTA download failed: ${e.javaClass.simpleName}: ${e.message}")
             }
         }.start()
+    }
+
+    private fun refreshVendorCatalog(url: String) {
+        if (url.isBlank()) {
+            logViewModel.addLog("Vendor catalog: URL is empty")
+            return
+        }
+
+        apViewModel.vendorCatalogUrl.value = url
+        apViewModel.saveVendorCatalogUrl()
+
+        Thread {
+            try {
+                logViewModel.addLog("Vendor catalog: downloading $url")
+                val text = URL(url).openConnection().apply {
+                    connectTimeout = 15000
+                    readTimeout = 30000
+                }.getInputStream().bufferedReader().use { it.readText() }
+
+                val root = JSONObject(text)
+                val itemsJson = root.getJSONArray("items")
+                val items = mutableListOf<VendorCatalogItem>()
+                for (i in 0 until itemsJson.length()) {
+                    val obj = itemsJson.getJSONObject(i)
+                    items.add(
+                        VendorCatalogItem(
+                            id = obj.optString("id"),
+                            title = obj.optString("title", obj.optString("file")),
+                            vendor = obj.optString("vendor"),
+                            mcu = obj.optString("mcu"),
+                            file = obj.optString("file"),
+                            url = obj.getString("url"),
+                            size = obj.optLong("size", -1L),
+                            sha256 = obj.optString("sha256"),
+                            experimental = obj.optBoolean("experimental", true)
+                        )
+                    )
+                }
+                mainThread {
+                    apViewModel.vendorCatalogItems.clear()
+                    apViewModel.vendorCatalogItems.addAll(items)
+                }
+                logViewModel.addLog("Vendor catalog: loaded ${items.size} entries")
+            } catch (e: Exception) {
+                logViewModel.addLog("Vendor catalog failed: ${e.javaClass.simpleName}: ${e.message}")
+            }
+        }.start()
+    }
+
+    private fun downloadVendorCatalogItem(item: VendorCatalogItem) {
+        logViewModel.addLog("Vendor catalog: selected ${item.title}")
+        downloadVendorOta(
+            item.url,
+            expectedSha256 = item.sha256.ifBlank { null },
+            expectedSize = item.size.takeIf { it >= 0 }
+        )
+    }
+
+    private fun sha256Hex(file: File): String {
+        val digest = MessageDigest.getInstance("SHA-256")
+        file.inputStream().use { input ->
+            val buffer = ByteArray(32 * 1024)
+            while (true) {
+                val read = input.read(buffer)
+                if (read < 0) break
+                digest.update(buffer, 0, read)
+            }
+        }
+        return digest.digest().joinToString("") { "%02x".format(it) }
     }
 
     private fun scanSuccess(results: List<ScanResult>?, wifiscanReceiver: BroadcastReceiver) {
@@ -856,6 +943,8 @@ fun MyApp(
     onWifiSetClick: () -> Unit,
     onRefreshVendorFiles: () -> Unit,
     onDownloadVendorUrl: (String) -> Unit,
+    onRefreshVendorCatalog: (String) -> Unit,
+    onDownloadVendorCatalogItem: (VendorCatalogItem) -> Unit,
     selTab: Int = 0
 ) {
     var tabIndex by remember { mutableIntStateOf(selTab) }
@@ -871,7 +960,7 @@ fun MyApp(
         }
         when (tabIndex) {
             0 -> MainTabContent(logViewModel,apViewModel,onScanClick,onConnectClick, onCheckDeviceClick, onFlashClick, onWifiReadClick, onWifiSetClick)
-            1 -> FilesTabContent(apViewModel, onRefreshVendorFiles, onDownloadVendorUrl)
+            1 -> FilesTabContent(apViewModel, onRefreshVendorFiles, onDownloadVendorUrl, onRefreshVendorCatalog, onDownloadVendorCatalogItem)
             2 -> LogTabContent(logViewModel)
         }
     }
@@ -1431,9 +1520,12 @@ Button(onClick = { onCheckDeviceClick(apViewModel.remoteIP.value) }) {
 fun FilesTabContent(
     apViewModel: ApViewModel,
     onRefreshVendorFiles: () -> Unit,
-    onDownloadVendorUrl: (String) -> Unit
+    onDownloadVendorUrl: (String) -> Unit,
+    onRefreshVendorCatalog: (String) -> Unit,
+    onDownloadVendorCatalogItem: (VendorCatalogItem) -> Unit
 ) {
     var url by remember { mutableStateOf("") }
+    var catalogUrl by remember { mutableStateOf(apViewModel.vendorCatalogUrl.value) }
 
     Column(
         modifier = Modifier
@@ -1449,9 +1541,26 @@ fun FilesTabContent(
                 color = MaterialTheme.colorScheme.onSurfaceVariant
             )
             OutlinedTextField(
+                value = catalogUrl,
+                onValueChange = { catalogUrl = it },
+                label = { Text("Catalog manifest URL") },
+                singleLine = false,
+                textStyle = TextStyle(color = MaterialTheme.colorScheme.onSurface),
+                modifier = Modifier.fillMaxWidth()
+            )
+            FilledTonalButton(
+                onClick = { onRefreshVendorCatalog(catalogUrl) },
+                modifier = Modifier.fillMaxWidth()
+            ) {
+                Text("Refresh online catalog")
+            }
+
+            Divider()
+
+            OutlinedTextField(
                 value = url,
                 onValueChange = { url = it },
-                label = { Text("OTA file URL") },
+                label = { Text("Direct OTA file URL") },
                 singleLine = false,
                 textStyle = TextStyle(color = MaterialTheme.colorScheme.onSurface),
                 modifier = Modifier.fillMaxWidth()
@@ -1468,6 +1577,42 @@ fun FilesTabContent(
                     modifier = Modifier.weight(1f)
                 ) {
                     Text("Refresh")
+                }
+            }
+        }
+
+        SectionCard("Online catalog") {
+            if (apViewModel.vendorCatalogItems.isEmpty()) {
+                Text(
+                    "No catalog entries loaded yet.",
+                    style = MaterialTheme.typography.bodyMedium,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
+            } else {
+                apViewModel.vendorCatalogItems.forEach { item ->
+                    Surface(
+                        shape = MaterialTheme.shapes.small,
+                        color = MaterialTheme.colorScheme.surfaceVariant,
+                        modifier = Modifier.fillMaxWidth()
+                    ) {
+                        Column(
+                            modifier = Modifier.padding(10.dp),
+                            verticalArrangement = Arrangement.spacedBy(6.dp)
+                        ) {
+                            Text(item.title, style = MaterialTheme.typography.bodyMedium, fontWeight = FontWeight.Medium)
+                            Text(
+                                "${item.vendor} ${item.mcu} - ${item.size} bytes",
+                                style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant
+                            )
+                            FilledTonalButton(
+                                onClick = { onDownloadVendorCatalogItem(item) },
+                                modifier = Modifier.fillMaxWidth()
+                            ) {
+                                Text("Download to local cache")
+                            }
+                        }
+                    }
                 }
             }
         }
