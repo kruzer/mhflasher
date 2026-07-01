@@ -8,7 +8,6 @@ Recent versions also include experimental restore flows: upgrading an existing O
 ## Features
 - **Simple Device Updating**: Select and flash devices with new firmware directly over the air. No soldering required.
 - **Broader Device Support**: Supports the classic Magic Home/Zengge UDP AT command OTA path and an additional CozyLife TCP/5555 OTA trigger.
-- **Zengge OTA Header Patching**: Builds OTA files with the vendor header fields required by newer Zengge/ZJ firmware.
 - **Standard and Small Firmware Images**: Includes a full OpenBeken image and a smaller minimal image for devices that report only 1MB flash.
 - **OpenBeken OTA Upgrade and Restore**: Can trigger OTA from devices already running OpenBeken, either to upgrade OpenBeken or to restore selected vendor firmware images.
 - **Experimental Vendor OTA Catalog**: Can download selected BL602 vendor OTA files generated from public flash dumps, including images based on the [FlashDumps IoT/BL602 collection](https://github.com/divadiow/FlashDumps/tree/main/IoT/BL602).
@@ -69,46 +68,6 @@ This flow is experimental. Vendor images are device-specific, so choose a matchi
 
 ## Experimental LN882H Support
 Some CozyLife devices use LN882H instead of BL602. The app includes an early TCP/5555 OTA path for this family and can flash an LN882H OpenBeken OTA image. This support is still experimental and depends on the exact vendor firmware behavior.
-
-## Reverse engineer risc-v chip
-All info is based on the process of a reverse engineering the risc-v Bouffalo Labs chip bl602 described [here](reverse_engineer/README.md)
-You can use a shell commands to achieve similar result:
-serve http file on port 1111:
-```shell
-OTA_FILE=OpenBL602_<version>_OTA.bin.xz.ota
-{
-    echo -ne "HTTP/1.0 200 OK\r\nContent-Length: "$(wc -c < "$OTA_FILE")"\r\n\r\n"
-    cat "$OTA_FILE"
-} | nc -l 1111
-```
-invoke flashing process (from another terminal):
-```shell
-echo -e "AT+UPURL=http://10.10.123.4:1111/update?version=33_00_20240418_OpenBeken&beta,pierogi" | nc -u 10.10.123.3 48899
-```
-List of all AT commands recognized by firmware is available [here](reverse_engineer/at_commands.txt) 
-For example to check version before flashing use:
-```shell
-echo -e "AT+LVER\r" | nc -u 10.10.123.3 48899
-```
-## TODO
-
-The following features are planned for future releases of Magic Home Flasher to enhance its functionality and user experience:
-
-- **Wi-Fi Settings Configuration**: Add the capability to change the SSID and password of the Magic Home device directly from the app. This feature will allow users to manage their device's network settings easily without needing additional tools.
-
-- **Automatic Firmware Updates**: Integrate functionality to automatically fetch the latest version of OpenBeken firmware from the GitHub repository. This will ensure that users always have access to the latest features and security updates without manually checking for new releases.
-
-These enhancements aim to streamline the user experience and expand the functionality of Magic Home Flasher, making it a more robust and convenient tool for updating Magic Home devices.
-
-## Contributing
-Contributions to Magic Home Flasher are welcome! Whether it's reporting issues, submitting fixes, or proposing new features, your help is appreciated.
-
-### How to Contribute
-1. Fork the repository.
-2. Create your feature branch (`git checkout -b feature/AmazingFeature`).
-3. Commit your changes (`git commit -m 'Add some AmazingFeature'`).
-4. Push to the branch (`git push origin feature/AmazingFeature`).
-5. Open a new Pull Request.
 
 ## License
 This project is licensed under the MIT License - see the [LICENSE.md](LICENSE.md) file for details.
